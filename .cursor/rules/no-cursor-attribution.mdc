@@ -1,0 +1,12 @@
+---
+description: Never add Cursor branding or AI tool attribution to commits or project metadata
+alwaysApply: true
+---
+
+# No Cursor / AI tool attribution
+
+- **Do not** add lines such as `Made with Cursor`, `Made-with: Cursor`, or similar to **git commit messages**, merge commit bodies, or PR descriptions.
+- **Do not** add `Co-authored-by:`, `Signed-off-by:`, or other trailer lines that attribute work to Cursor, AI assistants, or automated tools unless the **human** explicitly asks for a specific trailer.
+- When suggesting or running `git commit`, use only the message the user asked for or a neutral technical summary—no product plugs.
+
+If the user’s environment re-appends such lines via hooks, prefer `git -c core.hooksPath=/dev/null commit …` when amending so the message stays clean, and mention that hooks may need to be disabled for commits.

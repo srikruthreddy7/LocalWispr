@@ -1,0 +1,29 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# Xcode
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+timeline.xctimeline
+playground.xcworkspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Cursor / IDE
+.idea/
+
+# Logs
+*.log
+
+# Optional local install / packaging (DMGs and staged app bundles)
+dist/
+*.dmg

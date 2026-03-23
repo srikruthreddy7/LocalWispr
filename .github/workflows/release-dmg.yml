@@ -1,0 +1,48 @@
+# Builds dist/LocalWispr.dmg and creates a GitHub Release with the DMG attached.
+# Triggered by pushing a version tag (e.g. v1.0.0) or manually via workflow_dispatch.
+# Requires Xcode 26+ on the runner; if this fails, build locally (see docs/RELEASE.md)
+# and attach the DMG to a GitHub Release manually.
+
+name: Release DMG
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Build DMG
+        run: |
+          chmod +x scripts/build-dmg.sh
+          ./scripts/build-dmg.sh
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalWispr-dmg
+          path: |
+            dist/LocalWispr.dmg
+            dist/LocalWispr.dmg.sha256
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/LocalWispr.dmg
+            dist/LocalWispr.dmg.sha256
+          generate_release_notes: true
