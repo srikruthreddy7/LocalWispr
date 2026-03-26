@@ -48,6 +48,8 @@ public final class AppState: ObservableObject {
     @Published public private(set) var speechPermissionGranted: Bool = false
 
     @Published public private(set) var hotkeyRegistrationStatus: HotkeyRegistrationStatus = .pending
+    @Published public private(set) var awaitingShortcutVerification: Bool = false
+    @Published public private(set) var unavailableBindings: Set<GlobalHotkeyBinding> = []
 
     /// Global shortcut; persisted when not using an injected `HotkeyMonitoring` (tests).
     @Published public var globalHotkeyBinding: GlobalHotkeyBinding {
@@ -78,6 +80,8 @@ public final class AppState: ObservableObject {
     private static let globalHotkeyBindingDefaultsKey = "LocalWispr.globalHotkeyBinding"
 
     private var hasShownAccessibilityAlert = false
+    private var hasShownShortcutConflictAlert = false
+    private var shortcutVerificationWorkItem: DispatchWorkItem?
 
     public init(
         hotkeyMonitor: HotkeyMonitoring? = nil,
@@ -189,6 +193,7 @@ public final class AppState: ObservableObject {
     }
 
     public func toggleDictation() {
+        confirmShortcutVerified()
         Task {
             if state == .listening {
                 await stopDictation()
@@ -279,13 +284,12 @@ public final class AppState: ObservableObject {
 
         hotkeyMonitor.onToggleRequested = nil
         hotkeyMonitor.stop()
-
-        hotkeyMonitor = HotkeyFactory.makeMonitor(for: globalHotkeyBinding)
-        hotkeyMonitor.onToggleRequested = { [weak self] in
-            self?.toggleDictation()
-        }
+        awaitingShortcutVerification = false
+        shortcutVerificationWorkItem?.cancel()
+        shortcutVerificationWorkItem = nil
 
         guard globalHotkeyBinding != .none else {
+            hotkeyMonitor = HotkeyFactory.makeMonitor(for: .none)
             accessibilityPermissionGranted = checkAccessibilityPermission(promptIfNeeded: false)
             hotkeyRegistrationStatus = .inactive("Shortcut disabled in settings")
             return
@@ -293,16 +297,125 @@ public final class AppState: ObservableObject {
 
         accessibilityPermissionGranted = checkAccessibilityPermission(promptIfNeeded: false)
 
-        if globalHotkeyBinding.requiresAccessibility && !accessibilityPermissionGranted {
-            hotkeyRegistrationStatus = .failed("Accessibility access required for \(globalHotkeyBinding.menuTitle)")
-            return
+        // Probe all bindings to discover which are unavailable.
+        unavailableBindings = probeUnavailableBindings()
+
+        // Try the selected binding first, then fall back to alternatives.
+        let candidates = [globalHotkeyBinding] + GlobalHotkeyBinding.allCases.filter {
+            $0 != globalHotkeyBinding && $0 != .none
         }
 
-        do {
-            try hotkeyMonitor.start()
-            hotkeyRegistrationStatus = .listening(globalHotkeyBinding.menuTitle)
-        } catch {
-            hotkeyRegistrationStatus = .failed(error.localizedDescription)
+        for candidate in candidates {
+            if unavailableBindings.contains(candidate) { continue }
+            if candidate.requiresAccessibility && !accessibilityPermissionGranted {
+                continue
+            }
+
+            let monitor = HotkeyFactory.makeMonitor(for: candidate)
+            do {
+                try monitor.start()
+                hotkeyMonitor = monitor
+                hotkeyMonitor.onToggleRequested = { [weak self] in
+                    self?.toggleDictation()
+                }
+
+                if candidate != globalHotkeyBinding {
+                    // We fell back to a different shortcut.
+                    _globalHotkeyBinding = Published(initialValue: candidate)
+                    Self.saveGlobalHotkeyBinding(candidate)
+                    hotkeyRegistrationStatus = .listening(candidate.menuTitle)
+                    presentShortcutFallbackAlert(
+                        original: globalHotkeyBinding,
+                        fallback: candidate
+                    )
+                } else {
+                    hotkeyRegistrationStatus = .listening(candidate.menuTitle)
+                }
+
+                beginShortcutVerification()
+                return
+            } catch {
+                monitor.stop()
+                unavailableBindings.insert(candidate)
+            }
+        }
+
+        // All candidates failed.
+        hotkeyMonitor = HotkeyFactory.makeMonitor(for: .none)
+        hotkeyRegistrationStatus = .failed("No shortcut could be registered — all are in use by other apps")
+        presentShortcutConflictAlert()
+    }
+
+    /// Probe Carbon-based shortcuts to see which are already taken, without keeping them registered.
+    private func probeUnavailableBindings() -> Set<GlobalHotkeyBinding> {
+        var unavailable = Set<GlobalHotkeyBinding>()
+
+        for binding in GlobalHotkeyBinding.allCases where binding != .none {
+            if binding.requiresAccessibility && !accessibilityPermissionGranted {
+                continue // Can't probe these; skip rather than marking unavailable.
+            }
+
+            let probe = HotkeyFactory.makeMonitor(for: binding)
+            do {
+                try probe.start()
+                probe.stop()
+            } catch {
+                unavailable.insert(binding)
+            }
+        }
+
+        return unavailable
+    }
+
+    private func beginShortcutVerification() {
+        awaitingShortcutVerification = true
+
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.awaitingShortcutVerification = false
+            }
+        }
+        shortcutVerificationWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: workItem)
+    }
+
+    /// Called when the shortcut actually fires — confirms it's working.
+    private func confirmShortcutVerified() {
+        if awaitingShortcutVerification {
+            awaitingShortcutVerification = false
+            shortcutVerificationWorkItem?.cancel()
+            shortcutVerificationWorkItem = nil
+        }
+    }
+
+    private func presentShortcutFallbackAlert(original: GlobalHotkeyBinding, fallback: GlobalHotkeyBinding) {
+        let alert = NSAlert()
+        alert.messageText = "Shortcut Changed"
+        alert.informativeText = "\(original.menuTitle) is already in use by another app. LocalWispr switched to \(fallback.menuTitle) instead."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    private func presentShortcutConflictAlert() {
+        guard !hasShownShortcutConflictAlert else { return }
+        hasShownShortcutConflictAlert = true
+
+        let alert = NSAlert()
+        alert.messageText = "No Shortcut Available"
+        alert.informativeText = "All keyboard shortcuts are in use by other apps. Open Settings to choose a different shortcut, or close the conflicting app."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "Later")
+
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+
+        if response == .alertFirstButtonReturn {
+            controlPanelSection = .settings
+            showControlPanel()
         }
     }
 

@@ -506,15 +506,21 @@ public struct ControlPanelView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Menu {
                     ForEach(GlobalHotkeyBinding.allCases) { binding in
+                        let isUnavailable = appState.unavailableBindings.contains(binding)
                         Button {
-                            deferAction { appState.globalHotkeyBinding = binding }
+                            if !isUnavailable {
+                                deferAction { appState.globalHotkeyBinding = binding }
+                            }
                         } label: {
                             if binding == appState.globalHotkeyBinding {
                                 Label(binding.menuTitle, systemImage: "checkmark")
+                            } else if isUnavailable {
+                                Label("\(binding.menuTitle) — in use", systemImage: "xmark.circle")
                             } else {
                                 Text(binding.menuTitle)
                             }
                         }
+                        .disabled(isUnavailable)
                     }
                 } label: {
                     HStack(spacing: 12) {
@@ -542,11 +548,29 @@ public struct ControlPanelView: View {
                 .buttonStyle(.subtleGlass)
                 .accessibilityLabel("Global shortcut")
 
-                Text(appState.hotkeyRegistrationStatus.detailLine)
-                    .font(AppTheme.sans(13, weight: .regular))
-                    .foregroundStyle(AppTheme.secondaryText)
-                    .lineSpacing(2)
+                if appState.awaitingShortcutVerification {
+                    Text("Press \(appState.globalHotkeyBinding.menuTitle) now to verify it works")
+                        .font(AppTheme.sans(13, weight: .medium))
+                        .foregroundStyle(.orange)
+                        .lineSpacing(2)
+                } else {
+                    Text(appState.hotkeyRegistrationStatus.detailLine)
+                        .font(AppTheme.sans(13, weight: .regular))
+                        .foregroundStyle(hotkeyStatusColor)
+                        .lineSpacing(2)
+                }
             }
+        }
+    }
+
+    private var hotkeyStatusColor: Color {
+        switch appState.hotkeyRegistrationStatus {
+        case .listening:
+            return AppTheme.secondaryText
+        case .failed:
+            return .red.opacity(0.9)
+        case .inactive, .pending:
+            return AppTheme.secondaryText
         }
     }
 
