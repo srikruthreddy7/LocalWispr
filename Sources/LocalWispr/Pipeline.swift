@@ -8,7 +8,7 @@ public actor Pipeline {
     private let inserter: any Inserting
 
     public init(
-        cleaner: any Cleaning = TextCleaner(),
+        cleaner: any Cleaning = AdaptiveTextCleaner(),
         inserter: any Inserting = TextInserter()
     ) {
         self.cleaner = cleaner

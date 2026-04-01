@@ -107,7 +107,7 @@ public final class AppState: ObservableObject {
         self.audioCapture = audioCapture ?? AudioCapture()
         self.transcriber = resolvedTranscriber
         self.pipeline = Pipeline(
-            cleaner: cleaner ?? TextCleaner(),
+            cleaner: cleaner ?? AdaptiveTextCleaner(),
             inserter: inserter ?? TextInserter()
         )
         self.transcriptHistoryStore = transcriptHistoryStore ?? TranscriptHistoryStore()
