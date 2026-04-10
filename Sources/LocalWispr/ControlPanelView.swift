@@ -38,6 +38,7 @@ public struct ControlPanelView: View {
         .animation(.snappy(duration: 0.28, extraBounce: 0.02), value: appState.lastLatency)
         .animation(.snappy(duration: 0.28, extraBounce: 0.02), value: appState.hotkeyRegistrationStatus)
         .animation(.snappy(duration: 0.28, extraBounce: 0.02), value: appState.globalHotkeyBinding)
+        .animation(.snappy(duration: 0.28, extraBounce: 0.02), value: appState.globalHotkeyInteractionMode)
     }
 
     // MARK: - Background
@@ -117,6 +118,10 @@ public struct ControlPanelView: View {
                     Text(appState.globalHotkeyBinding.menuTitle)
                         .font(AppTheme.sans(14, weight: .medium))
                         .foregroundStyle(.white)
+
+                    Text("Mode: \(appState.globalHotkeyInteractionMode.menuTitle)")
+                        .font(AppTheme.sans(12, weight: .regular))
+                        .foregroundStyle(AppTheme.secondaryText)
 
                     Text(appState.hotkeyRegistrationStatus.detailLine)
                         .font(AppTheme.sans(12, weight: .regular))
@@ -294,7 +299,24 @@ public struct ControlPanelView: View {
                     .padding(.vertical, 14)
                 }
                 .buttonStyle(.solidProminent)
-                .disabled((!appState.allPermissionsGranted && appState.state != .listening) || appState.isBusy)
+                .disabled(appState.isBusy || appState.audioPreviewRecordingActive)
+
+                Button {
+                    deferAction { appState.toggleAudioPreviewCapture() }
+                } label: {
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(appState.audioPreviewRecordingActive ? AppTheme.danger : Color.white.opacity(0.78))
+                            .frame(width: 9, height: 9)
+                        Text(audioButtonTitle)
+                            .font(AppTheme.sans(15, weight: .semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 14)
+                }
+                .buttonStyle(.subtleGlass)
+                .disabled(appState.isBusy || appState.state == .listening)
 
                 Button {
                     deferAction { appState.copyLatestResult() }
@@ -362,25 +384,25 @@ public struct ControlPanelView: View {
     private var transcriptDeck: some View {
         LiquidCard(cornerRadius: 28, padding: 20) {
             VStack(alignment: .leading, spacing: 14) {
-                DeckHeader(title: "Latest Result", subtitle: "Always retrievable, even when insertion misses the focused field.")
+                DeckHeader(title: "Latest Result", subtitle: "Recorded audio and the resulting transcript for the most recent dictation run.")
 
                 HStack(spacing: 14) {
-                    TranscriptMiniPane(
-                        title: "Raw transcription",
-                        text: appState.lastRawTranscription,
-                        placeholder: "The raw transcript will appear here after each dictation session.",
-                        buttonTitle: "Copy Raw",
-                        action: { deferAction { appState.copyLastTranscription() } },
-                        enabled: appState.hasLastRawTranscription
+                    AudioCaptureMiniPane(
+                        title: "Recorded audio",
+                        audioURL: appState.latestCapturedAudioURL,
+                        isPlaying: appState.latestCapturedAudioIsPlaying,
+                        playAction: { deferAction { appState.toggleLatestCapturedAudioPlayback() } },
+                        revealAction: { deferAction { appState.revealLatestDebugCaptureInFinder() } },
+                        enabled: appState.hasLatestCapturedAudio
                     )
 
                     TranscriptMiniPane(
-                        title: "Cleaned output",
-                        text: appState.lastCleanedText,
-                        placeholder: "The cleaned version will appear here once the language model finishes.",
-                        buttonTitle: "Copy Cleaned",
-                        action: { deferAction { appState.copyLastCleanedText() } },
-                        enabled: appState.hasLastCleanedText
+                        title: "Latest transcript",
+                        text: appState.hasLastCleanedText ? appState.lastCleanedText : appState.lastRawTranscription,
+                        placeholder: "The transcript for the most recent dictation run will appear here.",
+                        buttonTitle: "Copy Transcript",
+                        action: { deferAction { appState.copyLatestResult() } },
+                        enabled: appState.hasLastRawTranscription || appState.hasLastCleanedText
                     )
                 }
             }
@@ -397,6 +419,24 @@ public struct ControlPanelView: View {
                 PermissionRow(title: "Accessibility", granted: appState.accessibilityPermissionGranted)
                 PermissionRow(title: "Microphone", granted: appState.microphonePermissionGranted)
                 PermissionRow(title: "Speech", granted: appState.speechPermissionGranted)
+
+                Divider()
+                    .overlay(AppTheme.softStroke)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("INPUT DEVICE")
+                        .font(AppTheme.mono(10, weight: .medium))
+                        .tracking(1.2)
+                        .foregroundStyle(AppTheme.tertiaryText)
+
+                    Text(appState.currentInputDeviceName)
+                        .font(AppTheme.sans(14, weight: .medium))
+                        .foregroundStyle(.white)
+
+                    Text(appState.liveInputLevelDescription)
+                        .font(AppTheme.sans(12, weight: .regular))
+                        .foregroundStyle(AppTheme.secondaryText)
+                }
 
                 Button {
                     deferAction { appState.requestAllPermissions() }
@@ -423,6 +463,14 @@ public struct ControlPanelView: View {
                         DeckHeader(title: "Transcriber", subtitle: "Choose the speech recognition mode.")
 
                         modeSelector
+                    }
+                }
+
+                LiquidCard(cornerRadius: 28, padding: 24) {
+                    VStack(alignment: .leading, spacing: 22) {
+                        DeckHeader(title: "Audio Input", subtitle: "Select the microphone LocalWispr captures from. Do not rely on the macOS default when debugging capture issues.")
+
+                        inputDeviceSection
                     }
                 }
 
@@ -501,6 +549,78 @@ public struct ControlPanelView: View {
         }
     }
 
+    private var inputDeviceSection: some View {
+        GlassEffectContainer(spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
+                Menu {
+                    ForEach(appState.availableInputDevices) { option in
+                        Button {
+                            deferAction { appState.selectInputDevice(option.deviceID) }
+                        } label: {
+                            if option.deviceID == appState.preferredInputDeviceID || (option.deviceID == nil && appState.preferredInputDeviceID == nil) {
+                                Label(option.menuTitle, systemImage: "checkmark")
+                            } else {
+                                Text(option.menuTitle)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Microphone")
+                                .font(AppTheme.mono(10, weight: .medium))
+                                .tracking(1.2)
+                                .foregroundStyle(AppTheme.tertiaryText)
+
+                            Text(appState.currentInputDeviceName)
+                                .font(AppTheme.sans(15, weight: .medium))
+                                .foregroundStyle(.white)
+
+                            let selectedOption = appState.availableInputDevices.first(where: {
+                                $0.deviceID == appState.preferredInputDeviceID || ($0.deviceID == nil && appState.preferredInputDeviceID == nil)
+                            })
+
+                            Text(selectedOption?.detailLine ?? "Choose a microphone for live dictation.")
+                                .font(AppTheme.sans(12, weight: .regular))
+                                .foregroundStyle(AppTheme.secondaryText)
+                        }
+
+                        Spacer(minLength: 0)
+
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(AppTheme.tertiaryText)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 14)
+                    .background(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(Color.white.opacity(0.06))
+                    )
+                }
+                .buttonStyle(.plain)
+
+                HStack(spacing: 10) {
+                    Label(appState.liveInputLevelDescription, systemImage: "waveform")
+                        .font(AppTheme.sans(13, weight: .medium))
+                        .foregroundStyle(.white)
+
+                    Spacer(minLength: 0)
+
+                    Button {
+                        deferAction { appState.refreshInputDevices() }
+                    } label: {
+                        Text("Refresh Inputs")
+                            .font(AppTheme.sans(13, weight: .medium))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.subtleGlass)
+                }
+            }
+        }
+    }
+
     private var globalShortcutSection: some View {
         GlassEffectContainer(spacing: 12) {
             VStack(alignment: .leading, spacing: 10) {
@@ -548,8 +668,46 @@ public struct ControlPanelView: View {
                 .buttonStyle(.subtleGlass)
                 .accessibilityLabel("Global shortcut")
 
+                Menu {
+                    ForEach(GlobalHotkeyInteractionMode.allCases) { mode in
+                        Button {
+                            deferAction { appState.globalHotkeyInteractionMode = mode }
+                        } label: {
+                            if mode == appState.globalHotkeyInteractionMode {
+                                Label(mode.menuTitle, systemImage: "checkmark")
+                            } else {
+                                Text(mode.menuTitle)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Interaction")
+                                .font(AppTheme.mono(10, weight: .medium))
+                                .tracking(1.2)
+                                .foregroundStyle(AppTheme.tertiaryText)
+
+                            Text(appState.globalHotkeyInteractionMode.menuTitle)
+                                .font(AppTheme.sans(15, weight: .medium))
+                                .foregroundStyle(.white)
+                        }
+
+                        Spacer()
+
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(AppTheme.secondaryText)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.subtleGlass)
+                .accessibilityLabel("Shortcut interaction mode")
+
                 if appState.awaitingShortcutVerification {
-                    Text("Press \(appState.globalHotkeyBinding.menuTitle) now to verify it works")
+                    Text("Use \(appState.globalHotkeyBinding.menuTitle) (\(appState.globalHotkeyInteractionMode.menuTitle)) now to verify it works")
                         .font(AppTheme.sans(13, weight: .medium))
                         .foregroundStyle(.orange)
                         .lineSpacing(2)
@@ -619,12 +777,18 @@ public struct ControlPanelView: View {
         appState.state == .listening ? "Stop Dictation" : "Start Dictation"
     }
 
+    private var audioButtonTitle: String {
+        appState.audioPreviewRecordingActive ? "Stop Recording" : "Record Audio Only"
+    }
+
     private var stateLabel: String {
         switch appState.state {
         case .idle:
             return "Idle"
         case .listening:
             return "Listening"
+        case .recordingAudio:
+            return "Recording Audio"
         case .finalizingTranscript:
             return "Finalizing"
         case .cleaning:
@@ -944,6 +1108,75 @@ private struct TranscriptMiniPane: View {
 
     private var displayColor: Color {
         text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? AppTheme.tertiaryText : .white
+    }
+}
+
+private struct AudioCaptureMiniPane: View {
+    let title: String
+    let audioURL: URL?
+    let isPlaying: Bool
+    let playAction: () -> Void
+    let revealAction: () -> Void
+    let enabled: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text(title)
+                    .font(AppTheme.sans(15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+
+                Spacer(minLength: 4)
+
+                Button(action: revealAction) {
+                    Text("Open Session")
+                        .font(AppTheme.sans(12, weight: .medium))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.subtleGlass)
+                .disabled(!enabled)
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text(enabled ? "Latest recording is attached to the current debug session." : "No recording captured yet for the current app session.")
+                    .font(AppTheme.sans(14, weight: .regular))
+                    .foregroundStyle(enabled ? .white : AppTheme.tertiaryText)
+                    .lineSpacing(2)
+
+                if let audioURL {
+                    Text(audioURL.lastPathComponent)
+                        .font(AppTheme.mono(11, weight: .medium))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                }
+
+                HStack(spacing: 10) {
+                    Button(action: playAction) {
+                        Text(isPlaying ? "Stop Audio" : "Play Audio")
+                            .font(AppTheme.sans(13, weight: .medium))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.solidProminent)
+                    .disabled(!enabled)
+
+                    if enabled {
+                        Label("Saved with transcript metadata", systemImage: "waveform")
+                            .font(AppTheme.sans(12, weight: .regular))
+                            .foregroundStyle(AppTheme.secondaryText)
+                    }
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.white.opacity(0.025))
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 }
 

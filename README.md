@@ -1,8 +1,8 @@
 # LocalWispr
 
-**LocalWispr** is a macOS app for **local voice dictation**: it captures speech with the microphone, transcribes on-device with Apple’s speech stack, optionally **cleans** text with **Apple Intelligence** (Foundation Models), and **inserts** the result at the cursor in the frontmost app.
+**LocalWispr** is a macOS app for **local voice dictation**: it captures speech with the microphone, transcribes on-device with **Parakeet Flash (FluidAudio)** on Apple Silicon (with Apple speech fallback), optionally **cleans** text with **Apple Intelligence** (Foundation Models), and **inserts** the result at the cursor in the frontmost app.
 
-There are no cloud services in the default path—audio and models stay on your Mac, subject to Apple’s speech and system APIs.
+There are no cloud services in the default path—audio and models stay on your Mac, subject to local ASR and system APIs.
 
 ---
 
@@ -31,13 +31,34 @@ To **build the DMG yourself** or **cut a release**, see **[docs/RELEASE.md](docs
 ## Features
 
 - **Global shortcut** to start/stop dictation (configurable; default includes options such as Right ⌘ double-tap).
-- **Live transcription session** using `SpeechAnalyzer` with buffer streaming; **batch fallback** if live finalization fails or times out.
+- **Live transcription session** using **Parakeet Flash (FluidAudio EOU streaming)** on Apple Silicon with incremental chunk processing.
+- **Fallback path** to Apple Speech (`SpeechAnalyzer` / legacy recognizer) and optional cloud STT fallback when explicitly enabled.
 - **Two transcriber modes**: Dictation (long-form) and Transcription (speech-oriented), user-selectable in Settings.
 - **Text cleanup** via `TextCleaner` (Apple Intelligence when available), with deterministic fallbacks and guardrail handling.
 - **Insertion** via Accessibility (direct text insertion when possible) or pasteboard + simulated paste.
 - **Dashboard UI** with control panel (Dashboard, History, Settings).
 - **Local transcript history** persisted on disk for review and copy.
 - **Latency metrics** (stop → transcript, cleanup, insert) surfaced in the UI.
+
+---
+
+## Latency SLO (hard target)
+
+LocalWispr should keep end-to-end latency from **user finishing dictation** to **final transcript appearing in the target text box** at:
+
+- **p90 < 1.0s**
+- **p99 <= 1.5s**
+
+This is the primary performance requirement for transcription + cleanup + insertion.
+
+---
+
+## Design principles
+
+- Build **general mechanisms**, not narrow fixes for one observed failure.
+- Do not hardcode product behavior around a specific phrase, site, browser title pattern, app, or one-off example.
+- When a test case exposes a bug, fix the underlying class of errors at the right abstraction layer.
+- Any accuracy improvement must preserve the latency target above unless there is a deliberate, explicit tradeoff.
 
 ---
 
@@ -78,6 +99,15 @@ The shipping app product is **`LocalWisprHost.app`** (bundle id `com.localwispr.
 swift build
 swift test
 ```
+
+---
+
+## ASR backend selection
+
+- Default behavior: prefer **Parakeet Flash** on Apple Silicon for English locales.
+- Override with environment variable:
+  - `LOCALWISPR_ASR_BACKEND=parakeet`
+  - `LOCALWISPR_ASR_BACKEND=apple`
 
 ---
 

@@ -43,7 +43,14 @@ public struct MenuBarView: View {
                     appState.toggleDictation()
                 }
             }
-            .disabled((!appState.allPermissionsGranted && appState.state != .listening) || appState.isBusy)
+            .disabled(appState.isBusy || appState.audioPreviewRecordingActive)
+
+            Button(appState.audioPreviewRecordingActive ? "Stop Audio Recording" : "Record Audio Only") {
+                DispatchQueue.main.async {
+                    appState.toggleAudioPreviewCapture()
+                }
+            }
+            .disabled(appState.isBusy || appState.state == .listening)
 
             Button("Open Control Panel") {
                 DispatchQueue.main.async {
@@ -55,6 +62,14 @@ public struct MenuBarView: View {
                 Button("Copy Latest Result") {
                     DispatchQueue.main.async {
                         appState.copyLatestResult()
+                    }
+                }
+            }
+
+            if appState.hasLatestCapturedAudio {
+                Button(appState.latestCapturedAudioIsPlaying ? "Stop Latest Audio" : "Play Latest Audio") {
+                    DispatchQueue.main.async {
+                        appState.toggleLatestCapturedAudioPlayback()
                     }
                 }
             }
@@ -77,6 +92,46 @@ public struct MenuBarView: View {
                         } else {
                             Text(binding.menuTitle)
                         }
+                    }
+                }
+            }
+
+            Menu("Interaction: \(appState.globalHotkeyInteractionMode.menuTitle)") {
+                ForEach(GlobalHotkeyInteractionMode.allCases) { mode in
+                    Button {
+                        DispatchQueue.main.async {
+                            appState.globalHotkeyInteractionMode = mode
+                        }
+                    } label: {
+                        if mode == appState.globalHotkeyInteractionMode {
+                            Label(mode.menuTitle, systemImage: "checkmark")
+                        } else {
+                            Text(mode.menuTitle)
+                        }
+                    }
+                }
+            }
+
+            Menu("Input: \(appState.currentInputDeviceName)") {
+                ForEach(appState.availableInputDevices) { option in
+                    Button {
+                        DispatchQueue.main.async {
+                            appState.selectInputDevice(option.deviceID)
+                        }
+                    } label: {
+                        if option.deviceID == appState.preferredInputDeviceID || (option.deviceID == nil && appState.preferredInputDeviceID == nil) {
+                            Label(option.menuTitle, systemImage: "checkmark")
+                        } else {
+                            Text(option.menuTitle)
+                        }
+                    }
+                }
+
+                Divider()
+
+                Button("Refresh Inputs") {
+                    DispatchQueue.main.async {
+                        appState.refreshInputDevices()
                     }
                 }
             }
@@ -137,7 +192,7 @@ public struct MenuBarStatusIconView: View {
             switch state {
             case .idle, .noSpeech, .error:
                 Image(systemName: "mic")
-            case .listening:
+            case .listening, .recordingAudio:
                 Circle()
                     .fill(Color.red)
                     .frame(width: 10, height: 10)

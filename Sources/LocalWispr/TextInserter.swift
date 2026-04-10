@@ -4,12 +4,15 @@ import CoreGraphics
 import Foundation
 
 public enum TextInserterError: LocalizedError {
+    case accessibilityPermissionRequired
     case failedToWritePasteboard
     case failedToCreateEventSource
     case failedToCreateKeyboardEvent
 
     public var errorDescription: String? {
         switch self {
+        case .accessibilityPermissionRequired:
+            return "Accessibility permission is required to insert text into other apps."
         case .failedToWritePasteboard:
             return "Failed to write cleaned text to pasteboard."
         case .failedToCreateEventSource:
@@ -84,6 +87,9 @@ public final class TextInserter: @unchecked Sendable, Inserting {
     public func insertAtCursor(_ text: String) async throws {
         let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return }
+        guard AXIsProcessTrusted() else {
+            throw TextInserterError.accessibilityPermissionRequired
+        }
 
         let target = await MainActor.run { () -> (pid: pid_t?, didActivate: Bool) in
             let pid = determinePasteTargetPID()

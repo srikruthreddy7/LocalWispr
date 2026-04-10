@@ -12,9 +12,15 @@ let package = Package(
             targets: ["LocalWispr"]
         )
     ],
+    dependencies: [
+        .package(url: "https://github.com/altic-dev/FluidAudio.git", branch: "B/cohere-coreml-asr")
+    ],
     targets: [
         .target(
             name: "LocalWispr",
+            dependencies: [
+                "FluidAudio"
+            ],
             resources: [
                 .process("Resources")
             ]

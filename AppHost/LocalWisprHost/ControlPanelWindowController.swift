@@ -70,6 +70,9 @@ final class ControlPanelWindowController: NSWindowController {
 
     func showControlPanel() {
         guard let window else { return }
+        if let frontmost = NSWorkspace.shared.frontmostApplication {
+            AppContextCapture.noteActivatedApplication(frontmost)
+        }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -78,6 +81,7 @@ final class ControlPanelWindowController: NSWindowController {
 final class LocalWisprHostAppDelegate: NSObject, NSApplicationDelegate {
     private var controlPanelObserver: NSObjectProtocol?
     private var didBecomeActiveObserver: NSObjectProtocol?
+    private var workspaceActivationObserver: NSObjectProtocol?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // LSUIElement apps have no Dock icon, so `applicationShouldHandleReopen` may never run.
@@ -115,6 +119,20 @@ final class LocalWisprHostAppDelegate: NSObject, NSApplicationDelegate {
                 AppState.shared.refreshAccessibilityAndHotkey()
             }
         }
+
+        workspaceActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { notification in
+            guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
+                return
+            }
+
+            Task { @MainActor in
+                AppContextCapture.noteActivatedApplication(application)
+            }
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -141,6 +159,10 @@ final class LocalWisprHostAppDelegate: NSObject, NSApplicationDelegate {
         if let didBecomeActiveObserver {
             NotificationCenter.default.removeObserver(didBecomeActiveObserver)
             self.didBecomeActiveObserver = nil
+        }
+        if let workspaceActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(workspaceActivationObserver)
+            self.workspaceActivationObserver = nil
         }
     }
 }

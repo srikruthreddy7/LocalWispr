@@ -21,8 +21,8 @@ This document describes how the app is structured, how data flows through it, an
      ▼                       ▼                       ▼
 ┌─────────────┐      ┌───────────────┐      ┌────────────────┐
 │ HotkeyMonitor│      │ AudioCapture  │      │ Transcriber   │
-│ (CGEvent tap)│      │ AVAudioEngine │      │ SpeechAnalyzer│
-└─────────────┘      └───────┬───────┘      │ live session   │
+│ (CGEvent tap)│      │ AVAudioEngine │      │ Parakeet EOU  │
+└─────────────┘      └───────┬───────┘      │ + Speech fallback │
                              │      └───────┬───────────────┘
                              │              │
                              └──────┬───────┘
@@ -50,7 +50,7 @@ This document describes how the app is structured, how data flows through it, an
 
 1. User triggers **`toggleDictation()`** (hotkey or UI).
 2. **`ensurePermissionsForDictation()`** checks microphone + speech (and accessibility if hotkey requires it).
-3. **`Transcriber.startSession`**** builds a **live** session (`SpeechAnalyzer` + `AsyncStream` of audio buffers).
+3. **`Transcriber.startSession`** builds a **live** session (Parakeet EOU streaming on Apple Silicon when enabled; otherwise Apple speech live path).
 4. **`AudioCapture.start()`** begins capture; each buffer is forwarded to **`session.append(buffer)`**.
 5. State becomes **`.listening`**.
 
@@ -80,7 +80,9 @@ This document describes how the app is structured, how data flows through it, an
 
 ## Transcription
 
-- **`Transcriber`** wraps **Speech** framework (`SpeechAnalyzer` + `AsyncStream<AnalyzerInput>`) for **streaming** live input.
+- **`Transcriber`** prefers **Parakeet Flash via FluidAudio** for low-latency local streaming on Apple Silicon.
+- Live path uses incremental streaming decode during capture and final flush on stop.
+- Fallback path remains Apple Speech (`SpeechAnalyzer` / legacy recognizer), then optional cloud STT fallback when enabled.
 - **Prewarm** (`prewarmModels`) warms both modes on boot to reduce first-session latency.
 - **Modes** (`TranscriberMode`): **dictationLong** vs **speechTranscription** — different analyzer presets for long dictation vs speech-style transcription.
 - **Fallback:** If live finalization fails or times out, buffered audio can be processed with a **batch** transcribe path.
@@ -135,6 +137,17 @@ This document describes how the app is structured, how data flows through it, an
 | **Cleanup before insert** | Simpler correctness: user sees inserted text match “final” cleaned output when insertion succeeds. |
 | **AX + paste fallback** | Maximizes compatibility across apps that don’t expose AX text APIs. |
 | **Custom button styles** | System `.glass` styles dim when the window is inactive; custom styles keep contrast stable. |
+
+---
+
+## Latency SLO
+
+Hard product target for end-to-end latency from user stop action to final text inserted into target app:
+
+- **p90 < 1.0s**
+- **p99 <= 1.5s**
+
+This SLO includes transcription, cleanup, and insertion.
 
 ---
 

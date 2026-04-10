@@ -6,11 +6,30 @@ extension AVAudioPCMBuffer: @unchecked @retroactive Sendable {}
 public enum DictationState: Equatable {
     case idle
     case listening
+    case recordingAudio
     case finalizingTranscript
     case cleaning
     case inserting
     case noSpeech
     case error(String)
+}
+
+struct PermissionCapabilities: Equatable, Sendable {
+    let accessibilityGranted: Bool
+    let microphoneGranted: Bool
+    let speechGranted: Bool
+
+    var canDictate: Bool {
+        microphoneGranted && speechGranted
+    }
+
+    var canInsertIntoOtherApps: Bool {
+        accessibilityGranted
+    }
+
+    var allGranted: Bool {
+        accessibilityGranted && microphoneGranted && speechGranted
+    }
 }
 
 public enum TranscriberMode: String, CaseIterable, Identifiable, Sendable, Codable {
@@ -276,8 +295,45 @@ public enum CleanerAvailability: Sendable, Equatable {
     case unavailable(String)
 }
 
+public struct AudioInputDeviceOption: Identifiable, Equatable, Sendable {
+    public let deviceID: UInt32?
+    public let name: String
+    public let detail: String?
+    public let isSystemDefault: Bool
+
+    public init(deviceID: UInt32?, name: String, detail: String? = nil, isSystemDefault: Bool = false) {
+        self.deviceID = deviceID
+        self.name = name
+        self.detail = detail?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.isSystemDefault = isSystemDefault
+    }
+
+    public var id: String {
+        if let deviceID {
+            return String(deviceID)
+        }
+        return "system-default"
+    }
+
+    public var menuTitle: String {
+        if isSystemDefault {
+            return "System Default — \(name)"
+        }
+        return name
+    }
+
+    public var detailLine: String {
+        if let detail, !detail.isEmpty {
+            return detail
+        }
+        return isSystemDefault ? "Uses the current macOS default input device." : "Dedicated input device"
+    }
+}
+
 public protocol HotkeyMonitoring: AnyObject {
     var onToggleRequested: (@MainActor () -> Void)? { get set }
+    var onStartRequested: (@MainActor () -> Void)? { get set }
+    var onStopRequested: (@MainActor () -> Void)? { get set }
     func start() throws
     func stop()
 }
@@ -285,12 +341,18 @@ public protocol HotkeyMonitoring: AnyObject {
 public protocol AudioCapturing: AnyObject {
     var outputAudioFormat: AVAudioFormat { get }
     var onBufferCaptured: (@Sendable (AVAudioPCMBuffer) -> Void)? { get set }
+    var preferredInputDeviceID: UInt32? { get set }
     func start() throws
     func stopAndDrain() throws -> [AVAudioPCMBuffer]
 }
 
 public protocol Transcribing: Sendable {
-    func transcribe(buffers: [AVAudioPCMBuffer], mode: TranscriberMode, locale: Locale) async throws -> String
+    func transcribe(
+        buffers: [AVAudioPCMBuffer],
+        mode: TranscriberMode,
+        locale: Locale,
+        contextualStrings: [String]
+    ) async throws -> String
 }
 
 public protocol LiveTranscriptionSession: Sendable {
@@ -303,7 +365,8 @@ public protocol LiveTranscribing: Sendable {
     func startSession(
         mode: TranscriberMode,
         locale: Locale,
-        audioFormat: AVAudioFormat
+        audioFormat: AVAudioFormat,
+        contextualStrings: [String]
     ) async throws -> any LiveTranscriptionSession
 }
 

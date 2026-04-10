@@ -26,7 +26,7 @@ public actor Pipeline {
         var insertionDuration: Duration = .zero
 
         let normalizedRaw = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedRaw.isEmpty else {
+        guard !normalizedRaw.isEmpty, Self.containsSubstantiveContent(normalizedRaw) else {
             let latency = Self.makeLatency(
                 stopToTranscriptMilliseconds: stopToTranscriptMilliseconds,
                 cleanupDuration: cleanupDuration,
@@ -114,6 +114,12 @@ public actor Pipeline {
         let components = duration.components
         let milliseconds = (Double(components.seconds) * 1_000.0) + (Double(components.attoseconds) / 1_000_000_000_000_000.0)
         return max(0, Int(milliseconds.rounded()))
+    }
+
+    private static func containsSubstantiveContent(_ text: String) -> Bool {
+        text.unicodeScalars.contains { scalar in
+            CharacterSet.alphanumerics.contains(scalar)
+        }
     }
 
     private static func logLatency(_ latency: PipelineLatency, outcome: StaticString) {
