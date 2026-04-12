@@ -1006,6 +1006,8 @@ public final class ContextAwareCloudCleaner: @unchecked Sendable, Cleaning {
         let endpoint: URL
         let model: String
         let apiKey: String
+        let reasoningEffort: String?
+        let maxTokens: Int?
     }
 
     private static let logger = Logger(subsystem: "LocalWispr", category: "CloudCleanup")
@@ -1085,15 +1087,20 @@ public final class ContextAwareCloudCleaner: @unchecked Sendable, Cleaning {
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         request.setValue("Bearer \(provider.apiKey)", forHTTPHeaderField: "Authorization")
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": provider.model,
             "temperature": 0,
-            "max_tokens": 220,
             "messages": [
                 ["role": "system", "content": Self.systemPrompt],
                 ["role": "user", "content": prompt]
             ]
         ]
+        if let reasoningEffort = provider.reasoningEffort {
+            body["reasoning_effort"] = reasoningEffort
+        }
+        if let maxTokens = provider.maxTokens {
+            body["max_tokens"] = maxTokens
+        }
 
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await performRequest(request)
@@ -1199,11 +1206,15 @@ public final class ContextAwareCloudCleaner: @unchecked Sendable, Cleaning {
         let env = DotEnv.merged()
 
         if let key = env["GROQ_API_KEY"], !key.isEmpty {
+            let model = env["LOCALWISPR_GROQ_MODEL"] ?? "openai/gpt-oss-120b"
+            let isGPTOSS = model.hasPrefix("openai/gpt-oss")
             return ProviderConfig(
                 name: "groq",
                 endpoint: URL(string: "https://api.groq.com/openai/v1/chat/completions")!,
-                model: env["LOCALWISPR_GROQ_MODEL"] ?? "llama-3.3-70b-versatile",
-                apiKey: key
+                model: model,
+                apiKey: key,
+                reasoningEffort: isGPTOSS ? (env["LOCALWISPR_GROQ_REASONING_EFFORT"] ?? "medium") : nil,
+                maxTokens: isGPTOSS ? nil : 220
             )
         }
 
