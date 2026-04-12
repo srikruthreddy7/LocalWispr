@@ -34,8 +34,73 @@ public enum TranscriberError: LocalizedError {
     }
 }
 
-private struct GroqTranscriptionResponse: Decodable {
+private struct GroqVerboseTranscriptionResponse: Decodable {
+    struct Segment: Decodable, Sendable {
+        let id: Int?
+        let start: Double
+        let end: Double
+        let text: String
+        let avgLogprob: Double?
+        let compressionRatio: Double?
+        let noSpeechProb: Double?
+
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case start
+            case end
+            case text
+            case avgLogprob = "avg_logprob"
+            case compressionRatio = "compression_ratio"
+            case noSpeechProb = "no_speech_prob"
+        }
+    }
+
     let text: String
+    let segments: [Segment]?
+}
+
+struct GroqStreamingChunkPlanner {
+    let chunkDurationSeconds: Double
+    let overlapSeconds: Double
+
+    private(set) var nextRegularStartSeconds: Double = 0
+    private(set) var lastDispatchedWindow: ClosedRange<Double>?
+
+    init(
+        chunkDurationSeconds: Double = 10,
+        overlapSeconds: Double = 2
+    ) {
+        self.chunkDurationSeconds = max(1, chunkDurationSeconds)
+        self.overlapSeconds = max(0, min(overlapSeconds, self.chunkDurationSeconds / 2))
+    }
+
+    mutating func nextRegularWindow(bufferedDurationSeconds: Double) -> ClosedRange<Double>? {
+        let end = nextRegularStartSeconds + chunkDurationSeconds
+        guard bufferedDurationSeconds + 0.0001 >= end else { return nil }
+
+        let window = nextRegularStartSeconds...end
+        lastDispatchedWindow = window
+        nextRegularStartSeconds += max(0.25, chunkDurationSeconds - overlapSeconds)
+        return window
+    }
+
+    mutating func finalWindow(totalDurationSeconds: Double) -> ClosedRange<Double>? {
+        guard totalDurationSeconds > 0 else { return nil }
+
+        let start = max(0, totalDurationSeconds - chunkDurationSeconds)
+        let window = start...totalDurationSeconds
+
+        if let lastDispatchedWindow {
+            let sameStart = abs(lastDispatchedWindow.lowerBound - window.lowerBound) < 0.01
+            let sameEnd = abs(lastDispatchedWindow.upperBound - window.upperBound) < 0.01
+            if sameStart && sameEnd {
+                return nil
+            }
+        }
+
+        lastDispatchedWindow = window
+        return window
+    }
 }
 
 private extension Data {
@@ -127,56 +192,143 @@ private final class LegacyRecognitionBridge: @unchecked Sendable {
 }
 
 private final class GroqLiveTranscriptionSession: @unchecked Sendable, LiveTranscriptionSession {
-    private let finalize: @Sendable ([AVAudioPCMBuffer]) async throws -> String
+    private let sampleRate: Double
+    private let transcribeChunk: @Sendable ([Float], ClosedRange<Double>) async throws -> GroqVerboseTranscriptionResponse
+    private let transcribeFull: @Sendable ([Float]) async throws -> String
+    private let transcriptUpdateHandler: (@Sendable (String) -> Void)?
+    private let streamingQueue = ParakeetStreamingQueue()
     private let stateLock = NSLock()
 
-    private var buffers: [AVAudioPCMBuffer] = []
+    private var planner = GroqStreamingChunkPlanner()
+    private var samples: [Float] = []
+    private var assembler = TranscriptAssembler()
+    private var latestAssembledTranscript: String = ""
+    private var chunkFailure: Error?
     private var isFinished = false
+    private var chunkRequestCount = 0
     private var bufferCount = 0
 
-    init(finalize: @escaping @Sendable ([AVAudioPCMBuffer]) async throws -> String) {
-        self.finalize = finalize
+    init(
+        sampleRate: Double,
+        transcriptUpdateHandler: (@Sendable (String) -> Void)? = nil,
+        transcribeChunk: @escaping @Sendable ([Float], ClosedRange<Double>) async throws -> GroqVerboseTranscriptionResponse,
+        transcribeFull: @escaping @Sendable ([Float]) async throws -> String
+    ) {
+        self.sampleRate = sampleRate
+        self.transcriptUpdateHandler = transcriptUpdateHandler
+        self.transcribeChunk = transcribeChunk
+        self.transcribeFull = transcribeFull
     }
 
     func append(_ buffer: AVAudioPCMBuffer) {
-        let copiedBuffer: AVAudioPCMBuffer
-        do {
-            copiedBuffer = try Self.copy(buffer: buffer)
-        } catch {
-            DebugLog.write("[GroqLive] failed to buffer audio: \(error.localizedDescription)")
-            return
-        }
+        let converted = Self.convertToFloatSamples(buffer)
+        guard !converted.isEmpty else { return }
 
-        let loggedBufferCount: Int? = withStateLock {
-            guard !isFinished else { return nil }
-            buffers.append(copiedBuffer)
+        let dispatches: [(window: ClosedRange<Double>, chunkSamples: [Float])] = withStateLock {
+            guard !isFinished else { return [] }
+
+            samples.append(contentsOf: converted)
             bufferCount += 1
-            return bufferCount == 1 || bufferCount % 50 == 0 ? bufferCount : nil
+            if bufferCount == 1 || bufferCount % 50 == 0 {
+                DebugLog.write("[GroqLive] buffer #\(bufferCount) frames=\(buffer.frameLength) samples=\(samples.count)")
+            }
+
+            let bufferedDurationSeconds = Double(samples.count) / sampleRate
+            var windows: [(window: ClosedRange<Double>, chunkSamples: [Float])] = []
+            while let window = planner.nextRegularWindow(bufferedDurationSeconds: bufferedDurationSeconds) {
+                windows.append((window: window, chunkSamples: sliceSamples(in: window, from: samples)))
+            }
+            return windows
         }
 
-        if let loggedBufferCount {
-            DebugLog.write("[GroqLive] buffer #\(loggedBufferCount) frames=\(buffer.frameLength) format=\(buffer.format) level=\(describeBufferLevel(buffer))")
+        for dispatch in dispatches {
+            enqueueChunk(dispatch.chunkSamples, window: dispatch.window, isFinalWindow: false)
         }
     }
 
     func finish() async throws -> String {
-        let snapshot = withStateLock { () -> [AVAudioPCMBuffer] in
-            if isFinished {
-                return buffers
+        let finishState = withStateLock { () -> (snapshot: [Float], finalWindow: ClosedRange<Double>?) in
+            if !isFinished {
+                isFinished = true
             }
 
-            isFinished = true
-            return buffers
+            let snapshot = samples
+            let totalDurationSeconds = Double(snapshot.count) / sampleRate
+            let finalWindow = planner.finalWindow(totalDurationSeconds: totalDurationSeconds)
+            return (snapshot, finalWindow)
         }
 
-        guard !snapshot.isEmpty else { return "" }
-        return try await finalize(snapshot).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !finishState.snapshot.isEmpty else { return "" }
+
+        if let finalWindow = finishState.finalWindow {
+            let tailSamples = sliceSamples(in: finalWindow, from: finishState.snapshot)
+            enqueueChunk(tailSamples, window: finalWindow, isFinalWindow: true)
+        }
+
+        await streamingQueue.waitForIdle()
+
+        let finalizedState = withStateLock { () -> (assembledTranscript: String, chunkCount: Int, chunkFailure: Error?) in
+            (
+                assembledTranscript: latestAssembledTranscript.trimmingCharacters(in: .whitespacesAndNewlines),
+                chunkCount: chunkRequestCount,
+                chunkFailure: chunkFailure
+            )
+        }
+
+        if finalizedState.chunkCount > 0, finalizedState.chunkFailure == nil, !finalizedState.assembledTranscript.isEmpty {
+            DebugLog.write("[GroqLive] assembled final transcript from \(finalizedState.chunkCount) background chunk(s)")
+            return finalizedState.assembledTranscript
+        }
+
+        if let failure = finalizedState.chunkFailure {
+            DebugLog.write("[GroqLive] falling back to single-request finalization after chunk failure: \(failure.localizedDescription)")
+        } else {
+            DebugLog.write("[GroqLive] no background chunks available, using single-request finalization")
+        }
+
+        return try await transcribeFull(finishState.snapshot).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func cancel() async {
         withStateLock {
             isFinished = true
-            buffers.removeAll(keepingCapacity: false)
+            samples.removeAll(keepingCapacity: false)
+        }
+        await streamingQueue.waitForIdle()
+    }
+
+    private func enqueueChunk(_ chunkSamples: [Float], window: ClosedRange<Double>, isFinalWindow: Bool) {
+        guard !chunkSamples.isEmpty else { return }
+        withStateLock {
+            chunkRequestCount += 1
+        }
+        let logPrefix = isFinalWindow ? "[GroqLive] final chunk" : "[GroqLive] chunk"
+        DebugLog.write("\(logPrefix) queued start=\(Self.formatSeconds(window.lowerBound)) end=\(Self.formatSeconds(window.upperBound)) duration=\(Self.formatSeconds(window.upperBound - window.lowerBound))")
+
+        streamingQueue.enqueue { [weak self, chunkSamples, window, isFinalWindow] in
+            guard let self else { return }
+
+            do {
+                let response = try await self.transcribeChunk(chunkSamples, window)
+                let updatedTranscript = self.withStateLock { () -> String in
+                    Self.consume(response: response, absoluteWindow: window, into: &self.assembler)
+                    let transcript = self.assembler.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.latestAssembledTranscript = transcript
+                    return transcript
+                }
+
+                DebugLog.write("[GroqLive] \(isFinalWindow ? "final " : "")chunk success start=\(Self.formatSeconds(window.lowerBound)) end=\(Self.formatSeconds(window.upperBound)) transcript=\(updatedTranscript.prefix(120))")
+                if !updatedTranscript.isEmpty {
+                    self.transcriptUpdateHandler?(updatedTranscript)
+                }
+            } catch {
+                self.withStateLock {
+                    if self.chunkFailure == nil {
+                        self.chunkFailure = error
+                    }
+                }
+                DebugLog.write("[GroqLive] \(isFinalWindow ? "final " : "")chunk failed start=\(Self.formatSeconds(window.lowerBound)) end=\(Self.formatSeconds(window.upperBound)) error=\(error.localizedDescription)")
+            }
         }
     }
 
@@ -186,59 +338,68 @@ private final class GroqLiveTranscriptionSession: @unchecked Sendable, LiveTrans
         return body()
     }
 
-    private static func copy(buffer: AVAudioPCMBuffer) throws -> AVAudioPCMBuffer {
-        guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) else {
-            throw TranscriberError.cloudRecognitionFailed("Unable to copy buffered audio")
+    private func sliceSamples(in window: ClosedRange<Double>, from source: [Float]) -> [Float] {
+        let startIndex = max(0, Int((window.lowerBound * sampleRate).rounded(.down)))
+        let endIndex = min(source.count, Int((window.upperBound * sampleRate).rounded(.up)))
+        guard startIndex < endIndex else { return [] }
+        return Array(source[startIndex..<endIndex])
+    }
+
+    private static func consume(
+        response: GroqVerboseTranscriptionResponse,
+        absoluteWindow: ClosedRange<Double>,
+        into assembler: inout TranscriptAssembler
+    ) {
+        if let segments = response.segments, !segments.isEmpty {
+            for segment in segments {
+                let start = max(absoluteWindow.lowerBound, absoluteWindow.lowerBound + segment.start)
+                let end = min(absoluteWindow.upperBound, absoluteWindow.lowerBound + segment.end)
+                guard end > start else { continue }
+
+                assembler.consume(
+                    text: segment.text,
+                    range: CMTimeRange(
+                        start: CMTime(seconds: start, preferredTimescale: 600),
+                        duration: CMTime(seconds: end - start, preferredTimescale: 600)
+                    ),
+                    isFinal: true
+                )
+            }
+            return
         }
 
-        copy.frameLength = buffer.frameLength
+        let normalized = response.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
+        assembler.consume(
+            text: normalized,
+            range: CMTimeRange(
+                start: CMTime(seconds: absoluteWindow.lowerBound, preferredTimescale: 600),
+                duration: CMTime(seconds: absoluteWindow.upperBound - absoluteWindow.lowerBound, preferredTimescale: 600)
+            ),
+            isFinal: true
+        )
+    }
 
-        let channelCount = Int(buffer.format.channelCount)
-        let frameLength = Int(buffer.frameLength)
-        let isInterleaved = buffer.format.isInterleaved
+    private static func convertToFloatSamples(_ buffer: AVAudioPCMBuffer) -> [Float] {
+        let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else { return [] }
 
         switch buffer.format.commonFormat {
         case .pcmFormatFloat32:
-            guard let source = buffer.floatChannelData, let destination = copy.floatChannelData else {
-                throw TranscriberError.cloudRecognitionFailed("Float audio copy failed")
-            }
-
-            if isInterleaved {
-                memcpy(destination[0], source[0], frameLength * channelCount * MemoryLayout<Float>.size)
-            } else {
-                for channel in 0..<channelCount {
-                    memcpy(destination[channel], source[channel], frameLength * MemoryLayout<Float>.size)
-                }
-            }
+            guard let channels = buffer.floatChannelData else { return [] }
+            return Array(UnsafeBufferPointer(start: channels[0], count: frameCount))
         case .pcmFormatInt16:
-            guard let source = buffer.int16ChannelData, let destination = copy.int16ChannelData else {
-                throw TranscriberError.cloudRecognitionFailed("Int16 audio copy failed")
-            }
-
-            if isInterleaved {
-                memcpy(destination[0], source[0], frameLength * channelCount * MemoryLayout<Int16>.size)
-            } else {
-                for channel in 0..<channelCount {
-                    memcpy(destination[channel], source[channel], frameLength * MemoryLayout<Int16>.size)
-                }
-            }
-        case .pcmFormatInt32:
-            guard let source = buffer.int32ChannelData, let destination = copy.int32ChannelData else {
-                throw TranscriberError.cloudRecognitionFailed("Int32 audio copy failed")
-            }
-
-            if isInterleaved {
-                memcpy(destination[0], source[0], frameLength * channelCount * MemoryLayout<Int32>.size)
-            } else {
-                for channel in 0..<channelCount {
-                    memcpy(destination[channel], source[channel], frameLength * MemoryLayout<Int32>.size)
-                }
-            }
+            guard let channels = buffer.int16ChannelData else { return [] }
+            let source = UnsafeBufferPointer(start: channels[0], count: frameCount)
+            let scale = Float(Int16.max)
+            return source.map { Float($0) / scale }
         default:
-            throw TranscriberError.cloudRecognitionFailed("Unsupported buffered audio format")
+            return []
         }
+    }
 
-        return copy
+    private static func formatSeconds(_ value: Double) -> String {
+        String(format: "%.2f", value)
     }
 }
 
@@ -659,6 +820,7 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
     public typealias ModelProgressHandler = @Sendable (Progress) -> Void
 
     public var onModelPreparationProgress: ModelProgressHandler?
+    public var onLiveTranscriptUpdate: (@Sendable (String) -> Void)?
 
     private let localeCoordinator = SpeechLocaleCoordinator()
     private var parakeetRealtimeProvider: ParakeetRealtimeProvider?
@@ -687,18 +849,36 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
         let prompt = Self.transcriptionPrompt(from: contextualStrings)
         DebugLog.write("[Transcriber] using Groq Whisper live session locale=\(locale.identifier) mode=\(mode) inputFormat=\(audioFormat)")
 
-        return GroqLiveTranscriptionSession { [weak self] buffers in
-            guard let self else {
-                throw CancellationError()
-            }
+        return GroqLiveTranscriptionSession(
+            sampleRate: audioFormat.sampleRate,
+            transcriptUpdateHandler: onLiveTranscriptUpdate,
+            transcribeChunk: { [weak self] samples, window in
+                guard let self else {
+                    throw CancellationError()
+                }
 
-            return try await self.transcribeWithGroq(
-                buffers: buffers,
-                locale: locale,
-                env: env,
-                prompt: prompt
-            )
-        }
+                return try await self.transcribeChunkWithGroq(
+                    samples: samples,
+                    absoluteWindow: window,
+                    locale: locale,
+                    env: env,
+                    prompt: prompt
+                )
+            },
+            transcribeFull: { [weak self] samples in
+                guard let self else {
+                    throw CancellationError()
+                }
+
+                return try await self.transcribeSamplesWithGroq(
+                    samples: samples,
+                    locale: locale,
+                    env: env,
+                    prompt: prompt,
+                    responseFormat: .json
+                ).text
+            }
+        )
     }
 
     public func transcribe(
@@ -1059,8 +1239,58 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
         env: [String: String],
         prompt: String? = nil
     ) async throws -> String {
+        let samples = Self.convertBuffersToFloatSamples(buffers)
+        guard !samples.isEmpty else {
+            throw TranscriberError.emptyAudio
+        }
+
+        return try await transcribeSamplesWithGroq(
+            samples: samples,
+            locale: locale,
+            env: env,
+            prompt: prompt,
+            responseFormat: .json
+        ).text
+    }
+
+    private func transcribeChunkWithGroq(
+        samples: [Float],
+        absoluteWindow: ClosedRange<Double>,
+        locale: Locale,
+        env: [String: String],
+        prompt: String? = nil
+    ) async throws -> GroqVerboseTranscriptionResponse {
+        let response = try await transcribeSamplesWithGroq(
+            samples: samples,
+            locale: locale,
+            env: env,
+            prompt: prompt,
+            responseFormat: .verboseJSON
+        )
+        DebugLog.write(
+            "[GroqSTTChunk] success start=\(String(format: "%.2f", absoluteWindow.lowerBound)) end=\(String(format: "%.2f", absoluteWindow.upperBound)) segments=\(response.segments?.count ?? 0) text=\(response.text.prefix(120))"
+        )
+        return response
+    }
+
+    private enum GroqResponseFormat: String {
+        case json = "json"
+        case verboseJSON = "verbose_json"
+    }
+
+    private func transcribeSamplesWithGroq(
+        samples: [Float],
+        locale: Locale,
+        env: [String: String],
+        prompt: String? = nil,
+        responseFormat: GroqResponseFormat
+    ) async throws -> GroqVerboseTranscriptionResponse {
         guard let apiKey = env["GROQ_API_KEY"], !apiKey.isEmpty else {
             throw TranscriberError.cloudRecognitionFailed("Missing GROQ_API_KEY")
+        }
+
+        guard !samples.isEmpty else {
+            throw TranscriberError.emptyAudio
         }
 
         let tempURL = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -1068,7 +1298,7 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
             .appendingPathExtension("wav")
 
         do {
-            try writeBuffers(buffers, toWavFileAt: tempURL)
+            try writeFloatSamples(samples, sampleRate: 16_000, toWavFileAt: tempURL)
             defer { try? FileManager.default.removeItem(at: tempURL) }
 
             let audioData = try Data(contentsOf: tempURL)
@@ -1085,11 +1315,17 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
 
             body.appendUTF8("--\(boundary)\r\n")
             body.appendUTF8("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n")
-            body.appendUTF8("json\r\n")
+            body.appendUTF8("\(responseFormat.rawValue)\r\n")
 
             body.appendUTF8("--\(boundary)\r\n")
             body.appendUTF8("Content-Disposition: form-data; name=\"temperature\"\r\n\r\n")
             body.appendUTF8("0\r\n")
+
+            if responseFormat == .verboseJSON {
+                body.appendUTF8("--\(boundary)\r\n")
+                body.appendUTF8("Content-Disposition: form-data; name=\"timestamp_granularities[]\"\r\n\r\n")
+                body.appendUTF8("segment\r\n")
+            }
 
             if let prompt, !prompt.isEmpty {
                 body.appendUTF8("--\(boundary)\r\n")
@@ -1121,14 +1357,14 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
                 throw TranscriberError.cloudRecognitionFailed("HTTP \(httpResponse.statusCode)")
             }
 
-            let decoded = try JSONDecoder().decode(GroqTranscriptionResponse.self, from: data)
+            let decoded = try JSONDecoder().decode(GroqVerboseTranscriptionResponse.self, from: data)
             let transcript = decoded.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !transcript.isEmpty else {
                 throw TranscriberError.cloudRecognitionFailed("Empty transcript")
             }
 
             DebugLog.write("[GroqSTT] success text=\(transcript.prefix(120))")
-            return transcript
+            return decoded
         } catch let error as TranscriberError {
             throw error
         } catch {
@@ -1151,6 +1387,24 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
         for buffer in buffers {
             try audioFile.write(from: buffer)
         }
+    }
+
+    private func writeFloatSamples(_ samples: [Float], sampleRate: Double, toWavFileAt url: URL) throws {
+        guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false) else {
+            throw TranscriberError.cloudRecognitionFailed("Unable to allocate WAV format")
+        }
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)) else {
+            throw TranscriberError.cloudRecognitionFailed("Unable to allocate WAV buffer")
+        }
+
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        if let channelData = buffer.floatChannelData {
+            samples.withUnsafeBufferPointer { source in
+                channelData[0].initialize(from: source.baseAddress!, count: samples.count)
+            }
+        }
+
+        try writeBuffers([buffer], toWavFileAt: url)
     }
 }
 

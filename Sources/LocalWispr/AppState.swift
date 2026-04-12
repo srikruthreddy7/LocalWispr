@@ -176,6 +176,13 @@ public final class AppState: ObservableObject {
             inserter: inserter ?? TextInserter()
         )
         self.transcriptHistoryStore = transcriptHistoryStore ?? TranscriptHistoryStore()
+        resolvedTranscriber.onLiveTranscriptUpdate = { [weak self] transcript in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard self.state == .listening || self.state == .finalizingTranscript else { return }
+                self.lastRawTranscription = transcript
+            }
+        }
 
         resolvedTranscriber.onModelPreparationProgress = { [weak self] progress in
             Task { @MainActor in
@@ -711,6 +718,8 @@ public final class AppState: ObservableObject {
         DebugLog.write("[AppState] startDictation: mode=\(mode)")
         refreshInputDeviceName()
         liveInputLevelDescription = "Armed"
+        lastRawTranscription = ""
+        lastCleanedText = ""
         activeDictationContext = nil
         activeContextualStrings = []
 
