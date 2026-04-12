@@ -59,7 +59,7 @@ final class PipelineTests: XCTestCase {
         XCTAssertTrue(inserted.isEmpty)
     }
 
-    func testUnavailableCleanerFallsBackToRawTranscript() async {
+    func testUnavailableCleanerFailsPipeline() async {
         let inserter = MockInserter()
         let pipeline = Pipeline(
             cleaner: MockCleaner(availability: .unavailable("model not ready"), result: .failure(TestError.cleanerFailed)),
@@ -72,21 +72,21 @@ final class PipelineTests: XCTestCase {
             recordingDurationMilliseconds: 2_400
         )
 
-        guard case .inserted(let raw, let cleaned, let warning, let latency) = result else {
-            return XCTFail("Expected inserted result")
+        guard case .failed(let raw, let cleaned, let error, let latency) = result else {
+            return XCTFail("Expected failed result")
         }
 
         XCTAssertEqual(raw, "hello there")
-        XCTAssertEqual(cleaned, "hello there")
-        XCTAssertNotNil(warning)
+        XCTAssertNil(cleaned)
+        XCTAssertTrue(error.contains("Text cleanup unavailable"))
         XCTAssertEqual(latency.stopToTranscriptMilliseconds, 120)
         XCTAssertGreaterThanOrEqual(latency.totalStopToInsertMilliseconds, 0)
 
         let inserted = await inserter.allInserted()
-        XCTAssertEqual(inserted, ["hello there"])
+        XCTAssertTrue(inserted.isEmpty)
     }
 
-    func testCleanerFailureFallsBackToRawTranscript() async {
+    func testCleanerFailureFailsPipeline() async {
         let inserter = MockInserter()
         let pipeline = Pipeline(
             cleaner: MockCleaner(availability: .available, result: .failure(TestError.cleanerFailed)),
@@ -99,15 +99,18 @@ final class PipelineTests: XCTestCase {
             recordingDurationMilliseconds: 2_100
         )
 
-        guard case .inserted(let raw, let cleaned, let warning, let latency) = result else {
-            return XCTFail("Expected inserted result")
+        guard case .failed(let raw, let cleaned, let error, let latency) = result else {
+            return XCTFail("Expected failed result")
         }
 
         XCTAssertEqual(raw, "raw speech")
-        XCTAssertEqual(cleaned, "raw speech")
-        XCTAssertNotNil(warning)
+        XCTAssertNil(cleaned)
+        XCTAssertTrue(error.contains("Text cleanup failed"))
         XCTAssertEqual(latency.stopToTranscriptMilliseconds, 300)
         XCTAssertGreaterThanOrEqual(latency.totalStopToInsertMilliseconds, 0)
+
+        let inserted = await inserter.allInserted()
+        XCTAssertTrue(inserted.isEmpty)
     }
 
     func testInsertionFailureReturnsFailedResult() async {

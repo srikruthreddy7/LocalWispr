@@ -781,11 +781,9 @@ public final class AppState: ObservableObject {
 
         let activeSession = liveTranscriptionSession
         liveTranscriptionSession = nil
-        let sessionContextualStrings = activeContextualStrings
-        activeContextualStrings = []
 
         let modeUsedForSession = activeSessionMode
-        var resolvedMode = modeUsedForSession
+        let resolvedMode = modeUsedForSession
 
         let buffers: [AVAudioPCMBuffer]
         let drainStartedAt = clock.now
@@ -798,6 +796,7 @@ public final class AppState: ObservableObject {
             }
             await SessionContextStore.shared.clear()
             activeDictationContext = nil
+            activeContextualStrings = []
             setError("Unable to stop microphone capture: \(error.localizedDescription)")
             return
         }
@@ -814,7 +813,6 @@ public final class AppState: ObservableObject {
         var rawText: String?
         var transcriptionError: Error?
         var liveFinalizationMilliseconds: Int?
-        var batchFallbackMilliseconds: Int?
         var transcriptSource: TranscriptResolutionSource = .unavailable
         let lowSignalDiagnosis = lowSignalMessage(for: buffers)
 
@@ -840,53 +838,6 @@ public final class AppState: ObservableObject {
             }
         }
 
-        let shouldAttemptBatchVerification = TranscriptResolutionPolicy.shouldAttemptBatchVerification(
-            liveTranscript: rawText,
-            recordingDurationMilliseconds: recordingDurationMilliseconds
-        )
-        let verifyingExistingLiveTranscript = rawText != nil && shouldAttemptBatchVerification
-
-        if (!buffers.isEmpty) && (rawText == nil || shouldAttemptBatchVerification) {
-            let fallbackStartedAt = clock.now
-            for fallbackMode in TranscriptResolutionPolicy.fallbackModes(after: modeUsedForSession) {
-                do {
-                    let fallbackTranscript = try await runWithTimeout(seconds: 10) {
-                        try await self.transcriber.transcribe(
-                            buffers: buffers,
-                            mode: fallbackMode,
-                            locale: .current,
-                            contextualStrings: sessionContextualStrings
-                        )
-                    } onTimeout: {
-                        DictationTimeoutError.batchFallback
-                    }
-
-                    if let normalizedTranscript = TranscriptResolutionPolicy.normalizedTranscript(fallbackTranscript) {
-                        let existingTranscript = rawText
-                        let preferredTranscript = TranscriptResolutionPolicy.preferredTranscript(
-                            primary: existingTranscript,
-                            alternative: normalizedTranscript
-                        )
-
-                        if existingTranscript == nil || preferredTranscript != existingTranscript {
-                            rawText = preferredTranscript
-                            resolvedMode = fallbackMode
-                            transcriptSource = .batchFallback
-                        }
-
-                        if rawText != nil && !verifyingExistingLiveTranscript {
-                            break
-                        }
-                    }
-
-                    transcriptionError = TranscriptResolutionError.emptyBatchTranscript(fallbackMode)
-                } catch {
-                    transcriptionError = error
-                }
-            }
-            batchFallbackMilliseconds = durationToMilliseconds(fallbackStartedAt.duration(to: clock.now))
-        }
-
         if let lowSignalDiagnosis {
             DebugLog.write("[AppState] low signal detected: \(lowSignalDiagnosis)")
             rawText = nil
@@ -902,7 +853,7 @@ public final class AppState: ObservableObject {
             bufferCount: buffers.count,
             drainMilliseconds: drainMilliseconds,
             liveFinalizationMilliseconds: liveFinalizationMilliseconds,
-            batchFallbackMilliseconds: batchFallbackMilliseconds,
+            batchFallbackMilliseconds: nil,
             liveFailureDescription: transcriptionError?.localizedDescription
         )
         lastStopPathDetails = stopPathDetails
@@ -914,8 +865,6 @@ public final class AppState: ObservableObject {
 
         guard let rawText else {
             isProcessing = false
-            await SessionContextStore.shared.clear()
-            activeDictationContext = nil
             let latency = PipelineLatency(
                 stopToTranscriptMilliseconds: stopToTranscriptMilliseconds,
                 cleanupMilliseconds: 0,
@@ -932,6 +881,9 @@ public final class AppState: ObservableObject {
                 modeUsedForSession: modeUsedForSession,
                 stopPathDetails: stopPathDetails
             )
+            await SessionContextStore.shared.clear()
+            activeDictationContext = nil
+            activeContextualStrings = []
             return
         }
 
@@ -947,9 +899,10 @@ public final class AppState: ObservableObject {
 
         DebugLog.write("[AppState] pipeline result: \(result)")
         isProcessing = false
+        handlePipelineResult(result, modeUsedForSession: resolvedMode, stopPathDetails: stopPathDetails)
         await SessionContextStore.shared.clear()
         activeDictationContext = nil
-        handlePipelineResult(result, modeUsedForSession: resolvedMode, stopPathDetails: stopPathDetails)
+        activeContextualStrings = []
     }
 
     private func runWithTimeout<T: Sendable>(

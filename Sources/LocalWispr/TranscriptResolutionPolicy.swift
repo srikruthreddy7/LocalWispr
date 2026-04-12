@@ -30,21 +30,13 @@ enum TranscriptResolutionPolicy {
         liveTranscript: String?,
         recordingDurationMilliseconds: Int?
     ) -> Bool {
-        guard normalizedTranscript(liveTranscript) == nil else {
-            return false
-        }
-
+        _ = liveTranscript
         _ = recordingDurationMilliseconds
-        return true
+        return false
     }
 
     static func fallbackModes(after preferredMode: TranscriberMode) -> [TranscriberMode] {
-        switch preferredMode {
-        case .dictationLong:
-            return [.dictationLong, .speechTranscription]
-        case .speechTranscription:
-            return [.speechTranscription]
-        }
+        [preferredMode]
     }
 
     private static func transcriptScore(_ text: String) -> Int {

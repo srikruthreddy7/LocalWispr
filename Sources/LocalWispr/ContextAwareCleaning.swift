@@ -905,9 +905,16 @@ public actor ProjectIdentifierIndex {
             }
         }
 
-        append(contentsOf: browserTokens(from: context.browserTabHint))
+        append(contentsOf: browserTitleTokens(from: context.browserTabHint, canonicalHost: canonicalHost))
 
         return Array(result.prefix(limit))
+    }
+
+    private static func browserTitleTokens(from title: String?, canonicalHost: String?) -> [String] {
+        guard let title, !title.isEmpty else { return [] }
+
+        let hostTokens = Set(browserTokens(from: canonicalHost).map { $0.lowercased() })
+        return browserTokens(from: title).filter { isUsefulBrowserTitleToken($0, hostTokens: hostTokens) }
     }
 
     private static func browserTokens(from text: String?) -> [String] {
@@ -954,6 +961,34 @@ public actor ProjectIdentifierIndex {
         }
 
         return lowercase.count >= 4
+    }
+
+    private static func isUsefulBrowserTitleToken(_ token: String, hostTokens: Set<String>) -> Bool {
+        guard isUsefulBrowserToken(token) else { return false }
+
+        let lowercase = token.lowercased()
+        if hostTokens.contains(lowercase) {
+            return true
+        }
+
+        guard token.rangeOfCharacter(from: .decimalDigits) == nil else {
+            return false
+        }
+
+        let lettersOnly = String(token.filter(\.isLetter))
+        if lettersOnly.count >= 4, lettersOnly == lettersOnly.uppercased() {
+            return true
+        }
+
+        if token.dropFirst().contains(where: \.isUppercase) {
+            return true
+        }
+
+        if token.contains("_") || token.contains("-") {
+            return true
+        }
+
+        return false
     }
 
     private static let browserStopWords: Set<String> = [
@@ -1022,17 +1057,23 @@ public final class ContextAwareCloudCleaner: @unchecked Sendable, Cleaning {
             }
             let sanitized = TextCleaner.sanitizeModelOutput(response)
             let cleaned = TextCleaner.applyFormattingDirectives(rawTranscription: trimmed, cleanedOutput: sanitized)
-            let guarded = Self.guardAgainstExpansiveRewrite(raw: trimmed, cleaned: cleaned)
-            if guarded != cleaned {
+            guard let guarded = Self.guardAgainstExpansiveRewrite(raw: trimmed, cleaned: cleaned) else {
                 DebugLog.write("[CloudCleaner] rejected expansive rewrite: raw=\(trimmed) cleaned=\(cleaned)")
+                throw TextCleanerError.generationFailure("Cloud cleanup rewrite rejected")
             }
             DebugLog.write("[CloudCleaner] SUCCESS: raw=\(trimmed) → cleaned=\(guarded)")
             Self.logger.info("Cloud cleanup provider=\(provider.name, privacy: .public) app=\(context.appName, privacy: .public) ids=\(identifiers.count, privacy: .public)")
-            return guarded.isEmpty ? TextCleaner.fastClean(rawTranscription: trimmed) : guarded
+            guard !guarded.isEmpty else {
+                throw TextCleanerError.generationFailure("Cloud cleanup returned empty output")
+            }
+            return guarded
         } catch {
             DebugLog.write("[CloudCleaner] FAILED: \(error)")
             Self.logger.error("Cloud cleanup failed: \(error.localizedDescription, privacy: .public)")
-            return TextCleaner.fastClean(rawTranscription: trimmed)
+            if let cleanerError = error as? TextCleanerError {
+                throw cleanerError
+            }
+            throw TextCleanerError.generationFailure(error.localizedDescription)
         }
     }
 
@@ -1139,9 +1180,6 @@ public final class ContextAwareCloudCleaner: @unchecked Sendable, Cleaning {
         if let activeDocumentHint = context.activeDocumentHint, !activeDocumentHint.isEmpty {
             lines.append("- Active file: \(activeDocumentHint)")
         }
-        if let browserTabHint = context.browserTabHint, !browserTabHint.isEmpty {
-            lines.append("- Browser tab: \(browserTabHint)")
-        }
         if let browserURL = context.browserURL, !browserURL.isEmpty {
             lines.append("- Browser URL: \(browserURL)")
         }
@@ -1159,15 +1197,6 @@ public final class ContextAwareCloudCleaner: @unchecked Sendable, Cleaning {
 
     private func configuredProvider() -> ProviderConfig? {
         let env = DotEnv.merged()
-
-        if let key = env["CEREBRAS_API_KEY"] ?? env["CEREPLUS_API_KEY"], !key.isEmpty {
-            return ProviderConfig(
-                name: "cerebras",
-                endpoint: URL(string: "https://api.cerebras.ai/v1/chat/completions")!,
-                model: env["LOCALWISPR_CEREBRAS_MODEL"] ?? "llama-3.3-70b",
-                apiKey: key
-            )
-        }
 
         if let key = env["GROQ_API_KEY"], !key.isEmpty {
             return ProviderConfig(
@@ -1197,21 +1226,21 @@ public final class ContextAwareCloudCleaner: @unchecked Sendable, Cleaning {
         }
     }
 
-    private static func guardAgainstExpansiveRewrite(raw: String, cleaned: String) -> String {
+    private static func guardAgainstExpansiveRewrite(raw: String, cleaned: String) -> String? {
         let trimmedCleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedCleaned.isEmpty else { return TextCleaner.fastClean(rawTranscription: raw) }
+        guard !trimmedCleaned.isEmpty else { return nil }
 
         let rawTokens = lexicalTokens(in: raw)
         let cleanedTokens = lexicalTokens(in: trimmedCleaned)
 
         guard !rawTokens.isEmpty, !cleanedTokens.isEmpty else {
-            return TextCleaner.fastClean(rawTranscription: raw)
+            return nil
         }
 
         let rawCount = rawTokens.count
         let cleanedCount = cleanedTokens.count
         if cleanedCount > rawCount + 1 || Double(cleanedCount) > (Double(rawCount) * 1.25) {
-            return TextCleaner.fastClean(rawTranscription: raw)
+            return nil
         }
 
         let rawTokenSet = Set(rawTokens)
@@ -1219,13 +1248,13 @@ public final class ContextAwareCloudCleaner: @unchecked Sendable, Cleaning {
         let addedTokenCount = cleanedTokenSet.subtracting(rawTokenSet).count
         let removedTokenCount = rawTokenSet.subtracting(cleanedTokenSet).count
         if addedTokenCount > removedTokenCount + 1 {
-            return TextCleaner.fastClean(rawTranscription: raw)
+            return nil
         }
 
         if trimmedCleaned.contains("://") || trimmedCleaned.contains("www.") || trimmedCleaned.contains(".com") || trimmedCleaned.contains(".ai") {
             let rawLower = raw.lowercased()
             if !rawLower.contains("://") && !rawLower.contains("www.") && !rawLower.contains(".com") && !rawLower.contains(".ai") {
-                return TextCleaner.fastClean(rawTranscription: raw)
+                return nil
             }
         }
 
@@ -1397,8 +1426,6 @@ public enum FuzzyIdentifierMatcher {
 
 public final class AdaptiveTextCleaner: @unchecked Sendable, Cleaning {
     private let cloudCleaner: ContextAwareCloudCleaner
-    private let localCleaner: TextCleaner
-    private let projectIndex: ProjectIdentifierIndex
 
     public init(
         cloudCleaner: ContextAwareCloudCleaner = ContextAwareCloudCleaner(),
@@ -1406,59 +1433,18 @@ public final class AdaptiveTextCleaner: @unchecked Sendable, Cleaning {
         projectIndex: ProjectIdentifierIndex = ProjectIdentifierIndex()
     ) {
         self.cloudCleaner = cloudCleaner
-        self.localCleaner = localCleaner
-        self.projectIndex = projectIndex
+        _ = localCleaner
+        _ = projectIndex
     }
 
     public var availability: CleanerAvailability {
-        switch (cloudCleaner.availability, localCleaner.availability) {
-        case (.available, _), (_, .available):
-            return .available
-        case (.unavailable(let cloudReason), .unavailable(let localReason)):
-            return .unavailable("cloud: \(cloudReason); local: \(localReason)")
-        }
+        cloudCleaner.availability
     }
 
     public func clean(_ rawText: String) async throws -> String {
         DebugLog.write("[AdaptiveCleaner] clean called: rawText=\(rawText.prefix(80))")
-        let env = DotEnv.merged()
-        if !ContextUsagePolicy.isEnabled(environment: env) {
-            let raw = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-            DebugLog.write("[AdaptiveCleaner] context disabled, returning raw transcript")
-            return raw
-        }
-
-        var cleaned: String
-
-        if case .available = cloudCleaner.availability {
-            DebugLog.write("[AdaptiveCleaner] using cloud cleaner")
-            cleaned = try await cloudCleaner.clean(rawText)
-        } else {
-            DebugLog.write("[AdaptiveCleaner] cloud unavailable, using local cleaner")
-            do {
-                cleaned = try await localCleaner.clean(rawText)
-            } catch {
-                DebugLog.write("[AdaptiveCleaner] local cleaner failed: \(error), falling back to fast clean")
-                cleaned = TextCleaner.fastClean(rawTranscription: rawText)
-            }
-        }
-
-        // Fuzzy post-processing: match cleaned text against project identifiers
-        let context: DictationAppContext
-        if let pinnedContext = await SessionContextStore.shared.get() {
-            context = pinnedContext
-        } else {
-            context = await MainActor.run { AppContextCapture.captureFrontmost() }
-        }
-        let identifiers = await projectIndex.tieredIdentifiers(context: context)
-        if context.surface != .browser, !identifiers.isEmpty {
-            let before = cleaned
-            cleaned = FuzzyIdentifierMatcher.postProcess(cleaned, identifiers: identifiers)
-            if cleaned != before {
-                DebugLog.write("[FuzzyMatch] \(before) → \(cleaned)")
-            }
-        }
-
+        DebugLog.write("[AdaptiveCleaner] using Groq cleaner")
+        let cleaned = try await cloudCleaner.clean(rawText)
         DebugLog.write("[AdaptiveCleaner] final output: \(cleaned)")
         return cleaned
     }

@@ -106,6 +106,31 @@ final class ProjectIdentifierIndexTests: XCTestCase {
         XCTAssertTrue(prompt.contains("fetchUsers"))
     }
 
+    func testBrowserUserPromptExcludesRawTitleWords() {
+        let context = DictationAppContext(
+            appName: "Google Chrome",
+            bundleIdentifier: "com.google.Chrome",
+            windowTitle: "LYNKUP™ | Expertise on Demand",
+            surface: .browser,
+            browserTabHint: "LYNKUP™ | Expertise on Demand",
+            browserURL: "https://lynkup.ai/",
+            browserHost: "lynkup.ai",
+            browserPathHint: "/"
+        )
+
+        let prompt = ContextAwareCloudCleaner.userPrompt(
+            rawText: "expert",
+            context: context,
+            identifiers: ["lynkup"]
+        )
+
+        XCTAssertTrue(prompt.contains("Browser host: lynkup.ai"))
+        XCTAssertTrue(prompt.contains("Preferred identifiers: lynkup"))
+        XCTAssertFalse(prompt.contains("Expertise"))
+        XCTAssertFalse(prompt.contains("Demand"))
+        XCTAssertFalse(prompt.contains("Browser tab:"))
+    }
+
     func testFindProjectRootFromSwiftFile() {
         // Uses the actual repo we're in as a test case
         let thisFile = #filePath
@@ -124,6 +149,27 @@ final class ProjectIdentifierIndexTests: XCTestCase {
         XCTAssertTrue(ProjectIdentifierIndex.isCodeFile(path: "/foo/bar.py"))
         XCTAssertFalse(ProjectIdentifierIndex.isCodeFile(path: "/foo/bar.png"))
         XCTAssertFalse(ProjectIdentifierIndex.isCodeFile(path: "/foo/bar.exe"))
+    }
+
+    func testBrowserHintsExcludeGenericTitleWords() async {
+        let index = ProjectIdentifierIndex()
+        let context = DictationAppContext(
+            appName: "Google Chrome",
+            bundleIdentifier: "com.google.Chrome",
+            windowTitle: "LYNKUP™ | Expertise on Demand",
+            surface: .browser,
+            browserTabHint: "LYNKUP™ | Expertise on Demand",
+            browserURL: "https://lynkup.ai/",
+            browserHost: "lynkup.ai",
+            browserPathHint: "/"
+        )
+
+        let identifiers = await index.tieredIdentifiers(context: context, limit: 20)
+
+        XCTAssertTrue(identifiers.contains("lynkup.ai"))
+        XCTAssertTrue(identifiers.contains("LYNKUP") || identifiers.contains("lynkup"))
+        XCTAssertFalse(identifiers.contains("Expertise"))
+        XCTAssertFalse(identifiers.contains("Demand"))
     }
 }
 

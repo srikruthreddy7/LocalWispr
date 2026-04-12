@@ -126,6 +126,122 @@ private final class LegacyRecognitionBridge: @unchecked Sendable {
     }
 }
 
+private final class GroqLiveTranscriptionSession: @unchecked Sendable, LiveTranscriptionSession {
+    private let finalize: @Sendable ([AVAudioPCMBuffer]) async throws -> String
+    private let stateLock = NSLock()
+
+    private var buffers: [AVAudioPCMBuffer] = []
+    private var isFinished = false
+    private var bufferCount = 0
+
+    init(finalize: @escaping @Sendable ([AVAudioPCMBuffer]) async throws -> String) {
+        self.finalize = finalize
+    }
+
+    func append(_ buffer: AVAudioPCMBuffer) {
+        let copiedBuffer: AVAudioPCMBuffer
+        do {
+            copiedBuffer = try Self.copy(buffer: buffer)
+        } catch {
+            DebugLog.write("[GroqLive] failed to buffer audio: \(error.localizedDescription)")
+            return
+        }
+
+        let loggedBufferCount: Int? = withStateLock {
+            guard !isFinished else { return nil }
+            buffers.append(copiedBuffer)
+            bufferCount += 1
+            return bufferCount == 1 || bufferCount % 50 == 0 ? bufferCount : nil
+        }
+
+        if let loggedBufferCount {
+            DebugLog.write("[GroqLive] buffer #\(loggedBufferCount) frames=\(buffer.frameLength) format=\(buffer.format) level=\(describeBufferLevel(buffer))")
+        }
+    }
+
+    func finish() async throws -> String {
+        let snapshot = withStateLock { () -> [AVAudioPCMBuffer] in
+            if isFinished {
+                return buffers
+            }
+
+            isFinished = true
+            return buffers
+        }
+
+        guard !snapshot.isEmpty else { return "" }
+        return try await finalize(snapshot).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func cancel() async {
+        withStateLock {
+            isFinished = true
+            buffers.removeAll(keepingCapacity: false)
+        }
+    }
+
+    private func withStateLock<T>(_ body: () -> T) -> T {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return body()
+    }
+
+    private static func copy(buffer: AVAudioPCMBuffer) throws -> AVAudioPCMBuffer {
+        guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) else {
+            throw TranscriberError.cloudRecognitionFailed("Unable to copy buffered audio")
+        }
+
+        copy.frameLength = buffer.frameLength
+
+        let channelCount = Int(buffer.format.channelCount)
+        let frameLength = Int(buffer.frameLength)
+        let isInterleaved = buffer.format.isInterleaved
+
+        switch buffer.format.commonFormat {
+        case .pcmFormatFloat32:
+            guard let source = buffer.floatChannelData, let destination = copy.floatChannelData else {
+                throw TranscriberError.cloudRecognitionFailed("Float audio copy failed")
+            }
+
+            if isInterleaved {
+                memcpy(destination[0], source[0], frameLength * channelCount * MemoryLayout<Float>.size)
+            } else {
+                for channel in 0..<channelCount {
+                    memcpy(destination[channel], source[channel], frameLength * MemoryLayout<Float>.size)
+                }
+            }
+        case .pcmFormatInt16:
+            guard let source = buffer.int16ChannelData, let destination = copy.int16ChannelData else {
+                throw TranscriberError.cloudRecognitionFailed("Int16 audio copy failed")
+            }
+
+            if isInterleaved {
+                memcpy(destination[0], source[0], frameLength * channelCount * MemoryLayout<Int16>.size)
+            } else {
+                for channel in 0..<channelCount {
+                    memcpy(destination[channel], source[channel], frameLength * MemoryLayout<Int16>.size)
+                }
+            }
+        case .pcmFormatInt32:
+            guard let source = buffer.int32ChannelData, let destination = copy.int32ChannelData else {
+                throw TranscriberError.cloudRecognitionFailed("Int32 audio copy failed")
+            }
+
+            if isInterleaved {
+                memcpy(destination[0], source[0], frameLength * channelCount * MemoryLayout<Int32>.size)
+            } else {
+                for channel in 0..<channelCount {
+                    memcpy(destination[channel], source[channel], frameLength * MemoryLayout<Int32>.size)
+                }
+            }
+        default:
+            throw TranscriberError.cloudRecognitionFailed("Unsupported buffered audio format")
+        }
+
+        return copy
+    }
+}
+
 private final class LegacyLiveTranscriptionSession: @unchecked Sendable, LiveTranscriptionSession {
     private let request = SFSpeechAudioBufferRecognitionRequest()
     private let stateLock = NSLock()
@@ -550,33 +666,10 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
     public init() {}
 
     public func prewarm(mode: TranscriberMode, locale: Locale, audioFormat: AVAudioFormat) async {
-        let env = DotEnv.merged()
-        if shouldUseParakeet(locale: locale, environment: env) {
-            do {
-                _ = try await ensureParakeetReady()
-                return
-            } catch {
-                DebugLog.write("[Parakeet] prewarm failed, falling back to Speech prewarm: \(error.localizedDescription)")
-            }
-        }
-
-        do {
-            let resolvedLocale = try await localeCoordinator.resolveAndReserveLocale(for: mode, requestedLocale: locale)
-            let preparation = makePreparation(mode: mode, locale: resolvedLocale)
-            let analyzer = SpeechAnalyzer(
-                modules: [preparation.module],
-                options: .init(priority: .userInitiated, modelRetention: .lingering)
-            )
-            let targetFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
-                compatibleWith: [preparation.module],
-                considering: audioFormat
-            ) ?? audioFormat
-            try await analyzer.prepareToAnalyze(in: targetFormat) { [weak self] progress in
-                self?.onModelPreparationProgress?(progress)
-            }
-        } catch {
-            // Warmup is best-effort.
-        }
+        _ = mode
+        _ = locale
+        _ = audioFormat
+        // Groq STT has no local warmup step.
     }
 
     public func startSession(
@@ -585,36 +678,27 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
         audioFormat: AVAudioFormat,
         contextualStrings: [String] = []
     ) async throws -> any LiveTranscriptionSession {
-        let resolvedLocale = try await localeCoordinator.resolveAndReserveLocale(for: mode, requestedLocale: locale)
-
         let env = DotEnv.merged()
-        let explicitParakeet = isParakeetExplicitlyRequested(environment: env)
-        if shouldUseParakeet(locale: resolvedLocale, environment: env) {
-            do {
-                let provider = try await ensureParakeetReady()
-                DebugLog.write("[Transcriber] using Parakeet live session locale=\(resolvedLocale.identifier) mode=\(mode) inputFormat=\(audioFormat)")
-                let session = ParakeetLiveTranscriptionSession(provider: provider)
-                return wrapWithContextCorrectionIfNeeded(session, identifiers: contextualStrings, label: "live-parakeet")
-            } catch {
-                if explicitParakeet {
-                    DebugLog.write("[Transcriber] explicit Parakeet selection failed: \(error.localizedDescription)")
-                    throw error
-                }
-                DebugLog.write("[Transcriber] Parakeet live session unavailable, falling back to legacy recognizer: \(error.localizedDescription)")
+        guard let apiKey = env["GROQ_API_KEY"], !apiKey.isEmpty else {
+            throw TranscriberError.cloudRecognitionFailed("Missing GROQ_API_KEY")
+        }
+
+        _ = apiKey
+        let prompt = Self.transcriptionPrompt(from: contextualStrings)
+        DebugLog.write("[Transcriber] using Groq Whisper live session locale=\(locale.identifier) mode=\(mode) inputFormat=\(audioFormat)")
+
+        return GroqLiveTranscriptionSession { [weak self] buffers in
+            guard let self else {
+                throw CancellationError()
             }
-        }
 
-        guard let recognizer = SFSpeechRecognizer(locale: resolvedLocale) else {
-            throw TranscriberError.sessionInitializationFailed
+            return try await self.transcribeWithGroq(
+                buffers: buffers,
+                locale: locale,
+                env: env,
+                prompt: prompt
+            )
         }
-
-        DebugLog.write("[Transcriber] using legacy live recognizer locale=\(resolvedLocale.identifier) mode=\(mode) inputFormat=\(audioFormat)")
-        let session = LegacyLiveTranscriptionSession(
-            recognizer: recognizer,
-            mode: mode,
-            contextualStrings: contextualStrings
-        )
-        return wrapWithContextCorrectionIfNeeded(session, identifiers: contextualStrings, label: "live-legacy")
     }
 
     public func transcribe(
@@ -628,42 +712,24 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
         }
 
         let env = DotEnv.merged()
-        let explicitParakeet = isParakeetExplicitlyRequested(environment: env)
-        let cloudFallbackEnabled = CloudSpeechFallbackPolicy.isEnabled(environment: env)
-        if shouldUseParakeet(locale: locale, environment: env) {
-            do {
-                return try await transcribeWithParakeet(buffers: buffers, contextualStrings: contextualStrings)
-            } catch {
-                DebugLog.write("[ParakeetBatch] failed mode=\(mode): \(error.localizedDescription)")
-                if explicitParakeet {
-                    throw error
-                }
-                if cloudFallbackEnabled {
-                    DebugLog.write("[GroqSTT] bypassing local batch fallbacks after Parakeet failure for mode=\(mode)")
-                    let transcript = try await transcribeWithGroq(buffers: buffers, locale: locale, env: env)
-                    return applyContextualCorrections(transcript, identifiers: contextualStrings, label: "batch-groq")
-                }
-            }
-        }
+        let prompt = Self.transcriptionPrompt(from: contextualStrings)
+        DebugLog.write("[Transcriber] using Groq Whisper batch locale=\(locale.identifier) mode=\(mode) buffers=\(buffers.count)")
+        return try await transcribeWithGroq(buffers: buffers, locale: locale, env: env, prompt: prompt)
+    }
 
-        do {
-            let transcript = try await transcribeWithSpeechAnalyzer(buffers: buffers, mode: mode, locale: locale)
-            return applyContextualCorrections(transcript, identifiers: contextualStrings, label: "batch-speech-analyzer")
-        } catch {
-            DebugLog.write("[SpeechAnalyzerBatch] failed mode=\(mode): \(error.localizedDescription)")
-        }
+    private static func transcriptionPrompt(from contextualStrings: [String]) -> String? {
+        let hints = Array(
+            NSOrderedSet(
+                array: contextualStrings
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+            )
+        ) as? [String] ?? contextualStrings
 
-        do {
-            let transcript = try await transcribeWithLegacyRecognizer(buffers: buffers, mode: mode, locale: locale)
-            return applyContextualCorrections(transcript, identifiers: contextualStrings, label: "batch-legacy")
-        } catch {
-            guard cloudFallbackEnabled else {
-                throw error
-            }
-            DebugLog.write("[GroqSTT] local recognition failed for mode=\(mode): \(error.localizedDescription)")
-            let transcript = try await transcribeWithGroq(buffers: buffers, locale: locale, env: env)
-            return applyContextualCorrections(transcript, identifiers: contextualStrings, label: "batch-groq")
-        }
+        let topHints = Array(hints.prefix(12))
+        guard !topHints.isEmpty else { return nil }
+
+        return "Use these preferred spellings when they fit the audio: \(topHints.joined(separator: ", "))."
     }
 
     private func shouldUseParakeet(locale: Locale, environment: [String: String]) -> Bool {
@@ -990,7 +1056,8 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
     private func transcribeWithGroq(
         buffers: [AVAudioPCMBuffer],
         locale: Locale,
-        env: [String: String]
+        env: [String: String],
+        prompt: String? = nil
     ) async throws -> String {
         guard let apiKey = env["GROQ_API_KEY"], !apiKey.isEmpty else {
             throw TranscriberError.cloudRecognitionFailed("Missing GROQ_API_KEY")
@@ -1023,6 +1090,12 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
             body.appendUTF8("--\(boundary)\r\n")
             body.appendUTF8("Content-Disposition: form-data; name=\"temperature\"\r\n\r\n")
             body.appendUTF8("0\r\n")
+
+            if let prompt, !prompt.isEmpty {
+                body.appendUTF8("--\(boundary)\r\n")
+                body.appendUTF8("Content-Disposition: form-data; name=\"prompt\"\r\n\r\n")
+                body.appendUTF8("\(prompt)\r\n")
+            }
 
             body.appendUTF8("--\(boundary)\r\n")
             body.appendUTF8("Content-Disposition: form-data; name=\"file\"; filename=\"capture.wav\"\r\n")

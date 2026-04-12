@@ -34,12 +34,12 @@ struct TranscriptResolutionPolicyTests {
     }
 
     @Test
-    func batchVerificationTriggersForShortLiveTranscript() {
+    func batchVerificationIsDisabled() {
         #expect(
             TranscriptResolutionPolicy.shouldAttemptBatchVerification(
                 liveTranscript: "Test software",
                 recordingDurationMilliseconds: 12_000
-            ) == true
+            ) == false
         )
         #expect(
             TranscriptResolutionPolicy.shouldAttemptBatchVerification(
@@ -50,15 +50,15 @@ struct TranscriptResolutionPolicyTests {
     }
 
     @Test
-    func dictationFallsBackToSpeechTranscription() {
+    func dictationKeepsPreferredModeOnly() {
         #expect(
             TranscriptResolutionPolicy.fallbackModes(after: .dictationLong) ==
-            [.dictationLong, .speechTranscription]
+            [.dictationLong]
         )
     }
 
     @Test
-    func speechTranscriptionDoesNotDuplicateFallbacks() {
+    func speechTranscriptionKeepsPreferredModeOnly() {
         #expect(
             TranscriptResolutionPolicy.fallbackModes(after: .speechTranscription) ==
             [.speechTranscription]
