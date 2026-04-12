@@ -2,6 +2,10 @@
 
 This file captures **non-binding** directions for future work. The shipped app may already implement some ideas partially; check the code and [ARCHITECTURE.md](ARCHITECTURE.md) for the source of truth.
 
+Hard latency SLO (binding across roadmap items):
+- **p90 < 1.0s** from user finishing dictation to final text inserted.
+- **p99 <= 1.5s** for the same end-to-end path.
+
 For detailed research behind the cloud pivot, see:
 - **[CLOUD-LLM-RESEARCH.md](CLOUD-LLM-RESEARCH.md)** — provider comparison, transport decisions, prompt strategy
 - **[CODEBASE-CONTEXT-RESEARCH.md](CODEBASE-CONTEXT-RESEARCH.md)** — editor detection, identifier extraction, ASR biasing, IDE extensions

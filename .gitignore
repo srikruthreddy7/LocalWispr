@@ -18,6 +18,9 @@ playground.xcworkspace
 .AppleDouble
 .LSOverride
 
+# Secrets
+.env
+
 # Cursor / IDE
 .idea/
 

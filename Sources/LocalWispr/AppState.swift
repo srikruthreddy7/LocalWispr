@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import AVFoundation
+import CoreAudio
 import Foundation
 import OSLog
 import ServiceManagement
@@ -19,6 +20,31 @@ public final class AppState: ObservableObject {
                 return "Live finalization timed out"
             case .batchFallback:
                 return "Batch transcription timed out"
+            }
+        }
+    }
+
+    private enum TranscriptResolutionError: LocalizedError {
+        case emptyLiveTranscript
+        case emptyBatchTranscript(TranscriberMode)
+
+        var errorDescription: String? {
+            switch self {
+            case .emptyLiveTranscript:
+                return "Live transcription returned no text"
+            case .emptyBatchTranscript(let mode):
+                return "\(mode.title) fallback returned no text"
+            }
+        }
+    }
+
+    private enum AudioSignalError: LocalizedError {
+        case lowInputLevel(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .lowInputLevel(let details):
+                return details
             }
         }
     }
@@ -46,6 +72,21 @@ public final class AppState: ObservableObject {
     @Published public private(set) var accessibilityPermissionGranted: Bool = false
     @Published public private(set) var microphonePermissionGranted: Bool = false
     @Published public private(set) var speechPermissionGranted: Bool = false
+    @Published public private(set) var availableInputDevices: [AudioInputDeviceOption] = []
+    @Published public private(set) var currentInputDeviceName: String = "Unknown Input"
+    @Published public private(set) var liveInputLevelDescription: String = "Idle"
+    @Published public private(set) var latestCapturedAudioURL: URL?
+    @Published public private(set) var latestDebugCaptureDirectoryURL: URL?
+    @Published public private(set) var latestCapturedAudioIsPlaying: Bool = false
+    @Published public private(set) var audioPreviewRecordingActive: Bool = false
+    @Published public var preferredInputDeviceID: UInt32? {
+        didSet {
+            guard preferredInputDeviceID != oldValue else { return }
+            Self.savePreferredInputDeviceID(preferredInputDeviceID)
+            audioCapture.preferredInputDeviceID = preferredInputDeviceID
+            refreshInputDevices()
+        }
+    }
 
     @Published public private(set) var hotkeyRegistrationStatus: HotkeyRegistrationStatus = .pending
     @Published public private(set) var awaitingShortcutVerification: Bool = false
@@ -61,26 +102,42 @@ public final class AppState: ObservableObject {
         }
     }
 
+    @Published public var globalHotkeyInteractionMode: GlobalHotkeyInteractionMode {
+        didSet {
+            guard hotkeyConfigManaged else { return }
+            guard globalHotkeyInteractionMode != oldValue else { return }
+            Self.saveGlobalHotkeyInteractionMode(globalHotkeyInteractionMode)
+            reconfigureHotkeyMonitor()
+        }
+    }
+
     private var hotkeyMonitor: HotkeyMonitoring
     private let hotkeyConfigManaged: Bool
     private let audioCapture: AudioCapturing
     private let transcriber: Transcriber
     private let pipeline: Pipeline
     private let transcriptHistoryStore: TranscriptHistoryStore
+    private let projectIndex: ProjectIdentifierIndex
 
     private let clock = ContinuousClock()
     private var listeningStartedAt: ContinuousClock.Instant?
     private var liveTranscriptionSession: (any LiveTranscriptionSession)?
     private var activeSessionMode: TranscriberMode = .dictationLong
+    private var activeDictationContext: DictationAppContext?
+    private var activeContextualStrings: [String] = []
+    private var audioPreviewPlayer: AVAudioPlayer?
+    private var pendingDebugCaptureAudioURL: URL?
     private var stopLatencyHistory: [Int] = []
 
     private var hasBootstrapped = false
     private var isProcessing = false
+    private var isStartingDictation = false
 
     private static let globalHotkeyBindingDefaultsKey = "LocalWispr.globalHotkeyBinding"
+    private static let globalHotkeyInteractionModeDefaultsKey = "LocalWispr.globalHotkeyInteractionMode"
+    private static let preferredInputDeviceDefaultsKey = "LocalWispr.preferredInputDeviceID"
 
     private var hasShownAccessibilityAlert = false
-    private var hasShownShortcutConflictAlert = false
     private var shortcutVerificationWorkItem: DispatchWorkItem?
 
     public init(
@@ -92,25 +149,40 @@ public final class AppState: ObservableObject {
         transcriptHistoryStore: TranscriptHistoryStore? = nil
     ) {
         let resolvedTranscriber = transcriber ?? Transcriber()
+        let preferredInputDeviceID = Self.loadPreferredInputDeviceID()
 
         if let hotkeyMonitor {
             self.hotkeyMonitor = hotkeyMonitor
             self.hotkeyConfigManaged = false
             self._globalHotkeyBinding = Published(initialValue: .rightCommandDoubleTap)
+            self._globalHotkeyInteractionMode = Published(initialValue: .toggle)
         } else {
             let binding = Self.loadGlobalHotkeyBinding()
-            self.hotkeyMonitor = HotkeyFactory.makeMonitor(for: binding)
+            let interactionMode = Self.loadGlobalHotkeyInteractionMode(defaultBinding: binding)
+            self.hotkeyMonitor = HotkeyFactory.makeMonitor(for: binding, interactionMode: interactionMode)
             self.hotkeyConfigManaged = true
             self._globalHotkeyBinding = Published(initialValue: binding)
+            self._globalHotkeyInteractionMode = Published(initialValue: interactionMode)
         }
+        self._preferredInputDeviceID = Published(initialValue: preferredInputDeviceID)
 
+        let sharedProjectIndex = ProjectIdentifierIndex()
+        self.projectIndex = sharedProjectIndex
         self.audioCapture = audioCapture ?? AudioCapture()
+        self.audioCapture.preferredInputDeviceID = preferredInputDeviceID
         self.transcriber = resolvedTranscriber
         self.pipeline = Pipeline(
-            cleaner: cleaner ?? TextCleaner(),
+            cleaner: cleaner ?? AdaptiveTextCleaner(projectIndex: sharedProjectIndex),
             inserter: inserter ?? TextInserter()
         )
         self.transcriptHistoryStore = transcriptHistoryStore ?? TranscriptHistoryStore()
+        resolvedTranscriber.onLiveTranscriptUpdate = { [weak self] transcript in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard self.state == .listening || self.state == .finalizingTranscript else { return }
+                self.lastRawTranscription = transcript
+            }
+        }
 
         resolvedTranscriber.onModelPreparationProgress = { [weak self] progress in
             Task { @MainActor in
@@ -122,29 +194,33 @@ public final class AppState: ObservableObject {
     public func bootstrap() {
         guard !hasBootstrapped else { return }
         hasBootstrapped = true
+        DebugLog.write("[AppState] bootstrap build=debug preferredInput=\(preferredInputDeviceID.map(String.init) ?? "system-default")")
 
-        hotkeyMonitor.onToggleRequested = { [weak self] in
-            self?.toggleDictation()
-        }
+        configureHotkeyCallbacks(for: hotkeyMonitor)
 
         refreshLaunchAtLoginStatus()
 
-        accessibilityPermissionGranted = checkAccessibilityPermission(promptIfNeeded: true)
-        if !accessibilityPermissionGranted {
-            statusLine = "Accessibility permission required for global hotkey"
-            presentAccessibilityAlert()
-        }
+        accessibilityPermissionGranted = checkAccessibilityPermission(promptIfNeeded: false)
+        refreshInputDevices()
 
         Task {
             await loadTranscriptHistory()
             await prewarmModels()
-            await refreshAudioAndSpeechPermissions()
+            await refreshAudioAndSpeechPermissions(promptIfNeeded: false, surfaceFailures: false)
             reconfigureHotkeyMonitor()
         }
     }
 
     public var allPermissionsGranted: Bool {
-        accessibilityPermissionGranted && microphonePermissionGranted && speechPermissionGranted
+        permissionCapabilities.allGranted
+    }
+
+    public var dictationPermissionsGranted: Bool {
+        permissionCapabilities.canDictate
+    }
+
+    public var canInsertIntoOtherApps: Bool {
+        permissionCapabilities.canInsertIntoOtherApps
     }
 
     public var isBusy: Bool {
@@ -163,7 +239,7 @@ public final class AppState: ObservableObject {
         }
 
         Task {
-            await refreshAudioAndSpeechPermissions()
+            await refreshAudioAndSpeechPermissions(promptIfNeeded: true, surfaceFailures: true)
             reconfigureHotkeyMonitor()
         }
     }
@@ -195,11 +271,115 @@ public final class AppState: ObservableObject {
     public func toggleDictation() {
         confirmShortcutVerified()
         Task {
+            guard !audioPreviewRecordingActive else { return }
             if state == .listening {
                 await stopDictation()
             } else {
                 await startDictation()
             }
+        }
+    }
+
+    public func toggleAudioPreviewCapture() {
+        confirmShortcutVerified()
+        Task {
+            if audioPreviewRecordingActive {
+                await stopAudioPreviewCapture()
+            } else {
+                await startAudioPreviewCapture()
+            }
+        }
+    }
+
+    private func startDictationFromHotkey() {
+        confirmShortcutVerified()
+        Task {
+            guard state != .listening, state != .recordingAudio else { return }
+            await startDictation()
+        }
+    }
+
+    private func stopDictationFromHotkey() {
+        confirmShortcutVerified()
+        Task {
+            if state == .listening {
+                await stopDictation()
+                return
+            }
+
+            // Press-and-hold can release before start transitions to `.listening`.
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            if state == .listening {
+                await stopDictation()
+            }
+        }
+    }
+
+    private func startAudioPreviewCapture() async {
+        guard !isProcessing, !audioPreviewRecordingActive, state != .listening else { return }
+        guard await ensurePermissionsForDictation() else { return }
+
+        refreshInputDeviceName()
+        liveInputLevelDescription = "Armed"
+        stopLatestCapturedAudioPlayback()
+
+        audioCapture.onBufferCaptured = { buffer in
+            if let levelSummary = Self.inputLevelSummary(for: buffer) {
+                Task { @MainActor [weak self] in
+                    self?.liveInputLevelDescription = levelSummary
+                }
+            }
+        }
+
+        do {
+            try audioCapture.start()
+            playStartSound()
+            audioPreviewRecordingActive = true
+            statusLine = "Recording audio only"
+            transition(to: .recordingAudio)
+        } catch {
+            audioCapture.onBufferCaptured = nil
+            setError("Unable to start audio recording: \(error.localizedDescription)")
+        }
+    }
+
+    private func stopAudioPreviewCapture() async {
+        guard audioPreviewRecordingActive else { return }
+
+        let buffers: [AVAudioPCMBuffer]
+        do {
+            buffers = try audioCapture.stopAndDrain()
+        } catch {
+            audioCapture.onBufferCaptured = nil
+            audioPreviewRecordingActive = false
+            setError("Unable to stop audio recording: \(error.localizedDescription)")
+            return
+        }
+
+        audioCapture.onBufferCaptured = nil
+        playStopSound()
+        pendingDebugCaptureAudioURL = dumpCapturedAudioIfEnabled(buffers)
+        audioPreviewRecordingActive = false
+
+        if let audioURL = pendingDebugCaptureAudioURL {
+            persistAudioOnlyDebugCaptureArtifacts(audioURL: audioURL)
+            statusLine = "Audio recording saved"
+        } else {
+            statusLine = "Audio recording unavailable"
+        }
+
+        transition(to: .idle)
+    }
+
+    private func configureHotkeyCallbacks(for monitor: HotkeyMonitoring) {
+        monitor.onToggleRequested = { [weak self] in
+            self?.toggleDictation()
+        }
+        monitor.onStartRequested = { [weak self] in
+            self?.startDictationFromHotkey()
+        }
+        monitor.onStopRequested = { [weak self] in
+            self?.stopDictationFromHotkey()
         }
     }
 
@@ -279,92 +459,91 @@ public final class AppState: ObservableObject {
         UserDefaults.standard.set(binding.rawValue, forKey: Self.globalHotkeyBindingDefaultsKey)
     }
 
+    private static func loadGlobalHotkeyInteractionMode(defaultBinding: GlobalHotkeyBinding) -> GlobalHotkeyInteractionMode {
+        if let raw = UserDefaults.standard.string(forKey: Self.globalHotkeyInteractionModeDefaultsKey),
+           let value = GlobalHotkeyInteractionMode(rawValue: raw) {
+            return value
+        }
+
+        // Keep legacy behavior for existing command-key users if no explicit mode was persisted.
+        if defaultBinding == .rightCommandDoubleTap || defaultBinding == .leftCommandDoubleTap {
+            return .doubleTap
+        }
+
+        return .toggle
+    }
+
+    private static func saveGlobalHotkeyInteractionMode(_ mode: GlobalHotkeyInteractionMode) {
+        UserDefaults.standard.set(mode.rawValue, forKey: Self.globalHotkeyInteractionModeDefaultsKey)
+    }
+
+    private static func loadPreferredInputDeviceID() -> UInt32? {
+        guard UserDefaults.standard.object(forKey: Self.preferredInputDeviceDefaultsKey) != nil else {
+            return nil
+        }
+        return UInt32(UserDefaults.standard.integer(forKey: Self.preferredInputDeviceDefaultsKey))
+    }
+
+    private static func savePreferredInputDeviceID(_ deviceID: UInt32?) {
+        if let deviceID {
+            UserDefaults.standard.set(Int(deviceID), forKey: Self.preferredInputDeviceDefaultsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.preferredInputDeviceDefaultsKey)
+        }
+    }
+
+    public func selectInputDevice(_ deviceID: UInt32?) {
+        preferredInputDeviceID = deviceID
+    }
+
+    public func refreshInputDevices() {
+        availableInputDevices = Self.availableInputDeviceOptions()
+        refreshInputDeviceName()
+    }
+
     private func reconfigureHotkeyMonitor() {
         guard hotkeyConfigManaged else { return }
 
         hotkeyMonitor.onToggleRequested = nil
+        hotkeyMonitor.onStartRequested = nil
+        hotkeyMonitor.onStopRequested = nil
         hotkeyMonitor.stop()
         awaitingShortcutVerification = false
         shortcutVerificationWorkItem?.cancel()
         shortcutVerificationWorkItem = nil
+        unavailableBindings = []
 
         guard globalHotkeyBinding != .none else {
-            hotkeyMonitor = HotkeyFactory.makeMonitor(for: .none)
+            hotkeyMonitor = HotkeyFactory.makeMonitor(for: .none, interactionMode: globalHotkeyInteractionMode)
             accessibilityPermissionGranted = checkAccessibilityPermission(promptIfNeeded: false)
             hotkeyRegistrationStatus = .inactive("Shortcut disabled in settings")
             return
         }
 
         accessibilityPermissionGranted = checkAccessibilityPermission(promptIfNeeded: false)
-
-        // Probe all bindings to discover which are unavailable.
-        unavailableBindings = probeUnavailableBindings()
-
-        // Try the selected binding first, then fall back to alternatives.
-        let candidates = [globalHotkeyBinding] + GlobalHotkeyBinding.allCases.filter {
-            $0 != globalHotkeyBinding && $0 != .none
+        guard accessibilityPermissionGranted else {
+            hotkeyMonitor = HotkeyFactory.makeMonitor(for: .none, interactionMode: globalHotkeyInteractionMode)
+            hotkeyRegistrationStatus = .failed("Accessibility permission is required for global shortcut capture")
+            return
         }
 
-        for candidate in candidates {
-            if unavailableBindings.contains(candidate) { continue }
-            if candidate.requiresAccessibility && !accessibilityPermissionGranted {
-                continue
-            }
+        let monitor = HotkeyFactory.makeMonitor(
+            for: globalHotkeyBinding,
+            interactionMode: globalHotkeyInteractionMode
+        )
 
-            let monitor = HotkeyFactory.makeMonitor(for: candidate)
-            do {
-                try monitor.start()
-                hotkeyMonitor = monitor
-                hotkeyMonitor.onToggleRequested = { [weak self] in
-                    self?.toggleDictation()
-                }
-
-                if candidate != globalHotkeyBinding {
-                    // We fell back to a different shortcut.
-                    _globalHotkeyBinding = Published(initialValue: candidate)
-                    Self.saveGlobalHotkeyBinding(candidate)
-                    hotkeyRegistrationStatus = .listening(candidate.menuTitle)
-                    presentShortcutFallbackAlert(
-                        original: globalHotkeyBinding,
-                        fallback: candidate
-                    )
-                } else {
-                    hotkeyRegistrationStatus = .listening(candidate.menuTitle)
-                }
-
-                beginShortcutVerification()
-                return
-            } catch {
-                monitor.stop()
-                unavailableBindings.insert(candidate)
-            }
+        do {
+            try monitor.start()
+            hotkeyMonitor = monitor
+            configureHotkeyCallbacks(for: hotkeyMonitor)
+            hotkeyRegistrationStatus = .listening("\(globalHotkeyBinding.menuTitle) (\(globalHotkeyInteractionMode.statusSuffix))")
+            beginShortcutVerification()
+        } catch {
+            monitor.stop()
+            hotkeyMonitor = HotkeyFactory.makeMonitor(for: .none, interactionMode: globalHotkeyInteractionMode)
+            let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+            hotkeyRegistrationStatus = .failed(message.isEmpty ? "Unable to register shortcut" : message)
         }
-
-        // All candidates failed.
-        hotkeyMonitor = HotkeyFactory.makeMonitor(for: .none)
-        hotkeyRegistrationStatus = .failed("No shortcut could be registered — all are in use by other apps")
-        presentShortcutConflictAlert()
-    }
-
-    /// Probe Carbon-based shortcuts to see which are already taken, without keeping them registered.
-    private func probeUnavailableBindings() -> Set<GlobalHotkeyBinding> {
-        var unavailable = Set<GlobalHotkeyBinding>()
-
-        for binding in GlobalHotkeyBinding.allCases where binding != .none {
-            if binding.requiresAccessibility && !accessibilityPermissionGranted {
-                continue // Can't probe these; skip rather than marking unavailable.
-            }
-
-            let probe = HotkeyFactory.makeMonitor(for: binding)
-            do {
-                try probe.start()
-                probe.stop()
-            } catch {
-                unavailable.insert(binding)
-            }
-        }
-
-        return unavailable
     }
 
     private func beginShortcutVerification() {
@@ -385,37 +564,6 @@ public final class AppState: ObservableObject {
             awaitingShortcutVerification = false
             shortcutVerificationWorkItem?.cancel()
             shortcutVerificationWorkItem = nil
-        }
-    }
-
-    private func presentShortcutFallbackAlert(original: GlobalHotkeyBinding, fallback: GlobalHotkeyBinding) {
-        let alert = NSAlert()
-        alert.messageText = "Shortcut Changed"
-        alert.informativeText = "\(original.menuTitle) is already in use by another app. LocalWispr switched to \(fallback.menuTitle) instead."
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "OK")
-
-        NSApplication.shared.activate(ignoringOtherApps: true)
-        alert.runModal()
-    }
-
-    private func presentShortcutConflictAlert() {
-        guard !hasShownShortcutConflictAlert else { return }
-        hasShownShortcutConflictAlert = true
-
-        let alert = NSAlert()
-        alert.messageText = "No Shortcut Available"
-        alert.informativeText = "All keyboard shortcuts are in use by other apps. Open Settings to choose a different shortcut, or close the conflicting app."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Open Settings")
-        alert.addButton(withTitle: "Later")
-
-        NSApplication.shared.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
-
-        if response == .alertFirstButtonReturn {
-            controlPanelSection = .settings
-            showControlPanel()
         }
     }
 
@@ -448,9 +596,20 @@ public final class AppState: ObservableObject {
         }
     }
 
-    private func refreshAudioAndSpeechPermissions() async {
-        microphonePermissionGranted = await requestMicrophoneAccessIfNeeded()
-        speechPermissionGranted = await requestSpeechAuthorizationIfNeeded()
+    private var permissionCapabilities: PermissionCapabilities {
+        PermissionCapabilities(
+            accessibilityGranted: accessibilityPermissionGranted,
+            microphoneGranted: microphonePermissionGranted,
+            speechGranted: speechPermissionGranted
+        )
+    }
+
+    private func refreshAudioAndSpeechPermissions(promptIfNeeded: Bool, surfaceFailures: Bool) async {
+        microphonePermissionGranted = await requestMicrophoneAccessIfNeeded(promptIfNeeded: promptIfNeeded)
+        speechPermissionGranted = await requestSpeechAuthorizationIfNeeded(promptIfNeeded: promptIfNeeded)
+        refreshInputDevices()
+
+        guard surfaceFailures else { return }
 
         if !microphonePermissionGranted {
             setError("Microphone permission denied. Click Grant Permissions.")
@@ -468,13 +627,39 @@ public final class AppState: ObservableObject {
         }
     }
 
-    private func requestMicrophoneAccessIfNeeded() async -> Bool {
-        await Self.requestMicrophoneAccess()
+    private func requestMicrophoneAccessIfNeeded(promptIfNeeded: Bool) async -> Bool {
+        switch Self.microphoneAuthorizationStatus() {
+        case .authorized:
+            return true
+        case .notDetermined:
+            return promptIfNeeded ? await Self.requestMicrophoneAccess() : false
+        case .denied, .restricted:
+            return false
+        @unknown default:
+            return false
+        }
     }
 
-    private func requestSpeechAuthorizationIfNeeded() async -> Bool {
-        let status = await Self.requestSpeechAuthorization()
-        return status == .authorized
+    private func requestSpeechAuthorizationIfNeeded(promptIfNeeded: Bool) async -> Bool {
+        switch Self.speechAuthorizationStatus() {
+        case .authorized:
+            return true
+        case .notDetermined:
+            let status = promptIfNeeded ? await Self.requestSpeechAuthorization() : .notDetermined
+            return status == .authorized
+        case .denied, .restricted:
+            return false
+        @unknown default:
+            return false
+        }
+    }
+
+    private nonisolated static func microphoneAuthorizationStatus() -> AVAuthorizationStatus {
+        AVCaptureDevice.authorizationStatus(for: .audio)
+    }
+
+    private nonisolated static func speechAuthorizationStatus() -> SFSpeechRecognizerAuthorizationStatus {
+        SFSpeechRecognizer.authorizationStatus()
     }
 
     private nonisolated static func requestMicrophoneAccess() async -> Bool {
@@ -495,17 +680,12 @@ public final class AppState: ObservableObject {
 
     private func ensurePermissionsForDictation() async -> Bool {
         accessibilityPermissionGranted = checkAccessibilityPermission(promptIfNeeded: false)
-        if !accessibilityPermissionGranted {
-            setError("Accessibility permission is required. Click Grant Permissions.")
-            presentAccessibilityAlert()
-            return false
+
+        if !dictationPermissionsGranted {
+            await refreshAudioAndSpeechPermissions(promptIfNeeded: true, surfaceFailures: true)
         }
 
-        if !microphonePermissionGranted || !speechPermissionGranted {
-            await refreshAudioAndSpeechPermissions()
-        }
-
-        if !microphonePermissionGranted || !speechPermissionGranted {
+        if !dictationPermissionsGranted {
             return false
         }
 
@@ -519,20 +699,62 @@ public final class AppState: ObservableObject {
     }
 
     private func startDictation() async {
-        guard !isProcessing else { return }
+        guard !isProcessing,
+              !isStartingDictation,
+              !audioPreviewRecordingActive,
+              state != .listening,
+              liveTranscriptionSession == nil else {
+            DebugLog.write("[AppState] startDictation skipped: isProcessing=\(isProcessing) isStarting=\(isStartingDictation) state=\(state) hasLiveSession=\(liveTranscriptionSession != nil)")
+            return
+        }
+
+        isStartingDictation = true
+        defer { isStartingDictation = false }
+
         guard await ensurePermissionsForDictation() else { return }
 
         let mode = transcriberMode
+        let contextEnabled = ContextUsagePolicy.isEnabled(environment: DotEnv.merged())
+        DebugLog.write("[AppState] startDictation: mode=\(mode)")
+        refreshInputDeviceName()
+        liveInputLevelDescription = "Armed"
+        lastRawTranscription = ""
+        lastCleanedText = ""
+        activeDictationContext = nil
+        activeContextualStrings = []
+
+        let contextualStrings: [String]
+        if contextEnabled {
+            let appContext = AppContextCapture.captureForDictationStart()
+            activeDictationContext = appContext
+            await SessionContextStore.shared.set(appContext)
+            DebugLog.write("[AppState] context: \(Self.debugContextSummary(appContext))")
+            contextualStrings = await projectIndex.tieredIdentifiers(context: appContext, limit: 100)
+            DebugLog.write("[AppState] contextual hints: count=\(contextualStrings.count) top=\(Array(contextualStrings.prefix(12)))")
+        } else {
+            await SessionContextStore.shared.clear()
+            DebugLog.write("[AppState] context disabled for live dictation")
+            contextualStrings = []
+        }
 
         do {
             let session = try await transcriber.startSession(
                 mode: mode,
                 locale: .current,
-                audioFormat: audioCapture.outputAudioFormat
+                audioFormat: audioCapture.outputAudioFormat,
+                contextualStrings: contextualStrings
             )
+
+            playStartSound()
+            try await Task.sleep(nanoseconds: 250_000_000)
 
             audioCapture.onBufferCaptured = { buffer in
                 session.append(buffer)
+                if let levelSummary = Self.inputLevelSummary(for: buffer) {
+                    Task { @MainActor [weak self] in
+                        self?.liveInputLevelDescription = levelSummary
+                    }
+                }
             }
 
             do {
@@ -545,20 +767,22 @@ public final class AppState: ObservableObject {
 
             liveTranscriptionSession = session
             activeSessionMode = mode
+            activeContextualStrings = contextualStrings
             listeningStartedAt = clock.now
 
             modelPreparationProgress = nil
-            playStartSound()
             transition(to: .listening)
         } catch {
+            await SessionContextStore.shared.clear()
+            activeDictationContext = nil
+            activeContextualStrings = []
             setError("Unable to start live transcription: \(error.localizedDescription)")
         }
     }
 
     private func stopDictation() async {
-        guard !isProcessing else { return }
-
-        playStopSound()
+        DebugLog.write("[AppState] stopDictation called")
+        guard !isProcessing else { DebugLog.write("[AppState] already processing, skipping"); return }
 
         let stopPressedAt = clock.now
         let recordingDurationMilliseconds = listeningStartedAt.map { durationToMilliseconds($0.duration(to: stopPressedAt)) }
@@ -568,6 +792,7 @@ public final class AppState: ObservableObject {
         liveTranscriptionSession = nil
 
         let modeUsedForSession = activeSessionMode
+        let resolvedMode = modeUsedForSession
 
         let buffers: [AVAudioPCMBuffer]
         let drainStartedAt = clock.now
@@ -578,11 +803,16 @@ public final class AppState: ObservableObject {
             if let activeSession {
                 await activeSession.cancel()
             }
+            await SessionContextStore.shared.clear()
+            activeDictationContext = nil
+            activeContextualStrings = []
             setError("Unable to stop microphone capture: \(error.localizedDescription)")
             return
         }
         let drainMilliseconds = durationToMilliseconds(drainStartedAt.duration(to: clock.now))
         audioCapture.onBufferCaptured = nil
+        playStopSound()
+        pendingDebugCaptureAudioURL = dumpCapturedAudioIfEnabled(buffers)
 
         isProcessing = true
         modelPreparationProgress = nil
@@ -592,19 +822,24 @@ public final class AppState: ObservableObject {
         var rawText: String?
         var transcriptionError: Error?
         var liveFinalizationMilliseconds: Int?
-        var batchFallbackMilliseconds: Int?
         var transcriptSource: TranscriptResolutionSource = .unavailable
+        let lowSignalDiagnosis = lowSignalMessage(for: buffers)
 
         if let activeSession {
             let liveFinalizationStartedAt = clock.now
             do {
-                rawText = try await runWithTimeout(seconds: 4) {
+                let liveTranscript = try await runWithTimeout(seconds: 4) {
                     try await activeSession.finish()
                 } onTimeout: {
                     DictationTimeoutError.liveFinalization
                 }
                 liveFinalizationMilliseconds = durationToMilliseconds(liveFinalizationStartedAt.duration(to: clock.now))
-                transcriptSource = .liveFinalization
+                rawText = TranscriptResolutionPolicy.normalizedTranscript(liveTranscript)
+                if rawText != nil {
+                    transcriptSource = .liveFinalization
+                } else {
+                    transcriptionError = TranscriptResolutionError.emptyLiveTranscript
+                }
             } catch {
                 liveFinalizationMilliseconds = durationToMilliseconds(liveFinalizationStartedAt.duration(to: clock.now))
                 transcriptionError = error
@@ -612,20 +847,11 @@ public final class AppState: ObservableObject {
             }
         }
 
-        if rawText == nil && !buffers.isEmpty {
-            let fallbackStartedAt = clock.now
-            do {
-                rawText = try await runWithTimeout(seconds: 10) {
-                    try await self.transcriber.transcribe(buffers: buffers, mode: modeUsedForSession, locale: .current)
-                } onTimeout: {
-                    DictationTimeoutError.batchFallback
-                }
-                batchFallbackMilliseconds = durationToMilliseconds(fallbackStartedAt.duration(to: clock.now))
-                transcriptSource = .batchFallback
-            } catch {
-                batchFallbackMilliseconds = durationToMilliseconds(fallbackStartedAt.duration(to: clock.now))
-                transcriptionError = error
-            }
+        if let lowSignalDiagnosis {
+            DebugLog.write("[AppState] low signal detected: \(lowSignalDiagnosis)")
+            rawText = nil
+            transcriptionError = AudioSignalError.lowInputLevel(lowSignalDiagnosis)
+            transcriptSource = .unavailable
         }
 
         lastRawTranscription = rawText ?? ""
@@ -636,13 +862,15 @@ public final class AppState: ObservableObject {
             bufferCount: buffers.count,
             drainMilliseconds: drainMilliseconds,
             liveFinalizationMilliseconds: liveFinalizationMilliseconds,
-            batchFallbackMilliseconds: batchFallbackMilliseconds,
+            batchFallbackMilliseconds: nil,
             liveFailureDescription: transcriptionError?.localizedDescription
         )
         lastStopPathDetails = stopPathDetails
         Self.logger.info(
             "Stop path source=\(stopPathDetails.source.rawValue, privacy: .public) buffers=\(stopPathDetails.bufferCount, privacy: .public) drain=\(stopPathDetails.drainMilliseconds, privacy: .public)ms live=\(stopPathDetails.liveFinalizationMilliseconds ?? -1, privacy: .public)ms batch=\(stopPathDetails.batchFallbackMilliseconds ?? -1, privacy: .public)ms liveFailure=\(stopPathDetails.liveFailureDescription ?? "none", privacy: .public)"
         )
+
+        DebugLog.write("[AppState] transcription done: rawText=\(rawText?.prefix(100) ?? "nil") source=\(transcriptSource) mode=\(resolvedMode)")
 
         guard let rawText else {
             isProcessing = false
@@ -662,6 +890,9 @@ public final class AppState: ObservableObject {
                 modeUsedForSession: modeUsedForSession,
                 stopPathDetails: stopPathDetails
             )
+            await SessionContextStore.shared.clear()
+            activeDictationContext = nil
+            activeContextualStrings = []
             return
         }
 
@@ -675,8 +906,12 @@ public final class AppState: ObservableObject {
             }
         }
 
+        DebugLog.write("[AppState] pipeline result: \(result)")
         isProcessing = false
-        handlePipelineResult(result, modeUsedForSession: modeUsedForSession, stopPathDetails: stopPathDetails)
+        handlePipelineResult(result, modeUsedForSession: resolvedMode, stopPathDetails: stopPathDetails)
+        await SessionContextStore.shared.clear()
+        activeDictationContext = nil
+        activeContextualStrings = []
     }
 
     private func runWithTimeout<T: Sendable>(
@@ -705,6 +940,48 @@ public final class AppState: ObservableObject {
         }
     }
 
+    private func dumpCapturedAudioIfEnabled(_ buffers: [AVAudioPCMBuffer]) -> URL? {
+        #if DEBUG
+        let shouldDumpAudio = true
+        #else
+        let environment = DotEnv.merged()
+        let rawValue = environment["LOCALWISPR_DUMP_AUDIO"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let shouldDumpAudio = rawValue.map { ["1", "true", "yes", "on"].contains($0) } ?? false
+        #endif
+        guard shouldDumpAudio else { return nil }
+        guard let firstBuffer = buffers.first else { return nil }
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let stamp = formatter.string(from: Date())
+        let directoryURL = URL(fileURLWithPath: "/tmp/localwispr-debug-captures", isDirectory: true)
+            .appendingPathComponent("session-\(stamp)", isDirectory: true)
+        let url = directoryURL.appendingPathComponent("audio.wav")
+
+        do {
+            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+            let file = try AVAudioFile(
+                forWriting: url,
+                settings: firstBuffer.format.settings,
+                commonFormat: firstBuffer.format.commonFormat,
+                interleaved: firstBuffer.format.isInterleaved
+            )
+            for buffer in buffers where buffer.frameLength > 0 {
+                try file.write(from: buffer)
+            }
+            DebugLog.write("[AppState] dumped captured audio to \(url.path)")
+            latestCapturedAudioURL = url
+            latestDebugCaptureDirectoryURL = directoryURL
+            latestCapturedAudioIsPlaying = false
+            audioPreviewPlayer?.stop()
+            audioPreviewPlayer = nil
+            return url
+        } catch {
+            DebugLog.write("[AppState] failed to dump captured audio: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
     private func applyPipelineStage(_ stage: PipelineStage) {
         switch stage {
         case .cleaning:
@@ -719,6 +996,12 @@ public final class AppState: ObservableObject {
         modeUsedForSession: TranscriberMode,
         stopPathDetails: StopPathDetails?
     ) {
+        persistDebugCaptureArtifactsIfNeeded(
+            for: result,
+            modeUsedForSession: modeUsedForSession,
+            stopPathDetails: stopPathDetails
+        )
+
         switch result {
         case .noSpeech(let latency):
             lastLatency = latency
@@ -762,6 +1045,134 @@ public final class AppState: ObservableObject {
             applyTranscriptHistory(records)
         } catch {
             Self.logger.error("Transcript history load failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func persistDebugCaptureArtifactsIfNeeded(
+        for result: PipelineResult,
+        modeUsedForSession: TranscriberMode,
+        stopPathDetails: StopPathDetails?
+    ) {
+        guard let audioURL = pendingDebugCaptureAudioURL else { return }
+        pendingDebugCaptureAudioURL = nil
+
+        let directoryURL = audioURL.deletingLastPathComponent()
+
+        do {
+            let metadata = DebugCaptureMetadata(
+                createdAt: Date(),
+                mode: modeUsedForSession.rawValue,
+                inputDeviceName: currentInputDeviceName,
+                inputLevel: liveInputLevelDescription,
+                audioPath: audioURL.path,
+                startContext: activeDictationContext.map(Self.debugContextPayload(from:)),
+                contextualHints: Array(activeContextualStrings.prefix(40)),
+                result: Self.debugResultPayload(from: result),
+                stopPath: stopPathDetails
+            )
+
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(metadata).write(
+                to: directoryURL.appendingPathComponent("session.json"),
+                options: .atomic
+            )
+
+            switch result {
+            case .inserted(let raw, let cleaned, _, _):
+                try raw.write(to: directoryURL.appendingPathComponent("raw.txt"), atomically: true, encoding: .utf8)
+                try cleaned.write(to: directoryURL.appendingPathComponent("cleaned.txt"), atomically: true, encoding: .utf8)
+            case .failed(let raw, let cleaned, let error, _):
+                if let raw {
+                    try raw.write(to: directoryURL.appendingPathComponent("raw.txt"), atomically: true, encoding: .utf8)
+                }
+                if let cleaned {
+                    try cleaned.write(to: directoryURL.appendingPathComponent("cleaned.txt"), atomically: true, encoding: .utf8)
+                }
+                try error.write(to: directoryURL.appendingPathComponent("error.txt"), atomically: true, encoding: .utf8)
+            case .noSpeech:
+                break
+            }
+
+            DebugLog.write("[AppState] wrote debug capture artifacts to \(directoryURL.path)")
+        } catch {
+            DebugLog.write("[AppState] failed to write debug capture artifacts: \(error.localizedDescription)")
+        }
+    }
+
+    private func persistAudioOnlyDebugCaptureArtifacts(audioURL: URL) {
+        pendingDebugCaptureAudioURL = nil
+        let directoryURL = audioURL.deletingLastPathComponent()
+
+        do {
+            let metadata = DebugCaptureMetadata(
+                createdAt: Date(),
+                mode: "audio-only",
+                inputDeviceName: currentInputDeviceName,
+                inputLevel: liveInputLevelDescription,
+                audioPath: audioURL.path,
+                startContext: nil,
+                contextualHints: [],
+                result: DebugCaptureResultPayload(
+                    kind: "audioOnly",
+                    rawText: nil,
+                    cleanedText: nil,
+                    error: nil,
+                    warning: nil,
+                    latency: PipelineLatency(
+                        stopToTranscriptMilliseconds: 0,
+                        cleanupMilliseconds: 0,
+                        insertionMilliseconds: 0,
+                        recordingDurationMilliseconds: nil
+                    )
+                ),
+                stopPath: nil
+            )
+
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(metadata).write(
+                to: directoryURL.appendingPathComponent("session.json"),
+                options: .atomic
+            )
+
+            DebugLog.write("[AppState] wrote audio-only debug capture artifacts to \(directoryURL.path)")
+        } catch {
+            DebugLog.write("[AppState] failed to write audio-only debug capture artifacts: \(error.localizedDescription)")
+        }
+    }
+
+    private static func debugResultPayload(from result: PipelineResult) -> DebugCaptureResultPayload {
+        switch result {
+        case .noSpeech(let latency):
+            return DebugCaptureResultPayload(
+                kind: "noSpeech",
+                rawText: nil,
+                cleanedText: nil,
+                error: nil,
+                warning: nil,
+                latency: latency
+            )
+        case .inserted(let raw, let cleaned, let warning, let latency):
+            return DebugCaptureResultPayload(
+                kind: "inserted",
+                rawText: raw,
+                cleanedText: cleaned,
+                error: nil,
+                warning: warning,
+                latency: latency
+            )
+        case .failed(let raw, let cleaned, let error, let latency):
+            return DebugCaptureResultPayload(
+                kind: "failed",
+                rawText: raw,
+                cleanedText: cleaned,
+                error: error,
+                warning: nil,
+                latency: latency
+            )
         }
     }
 
@@ -885,6 +1296,227 @@ public final class AppState: ObservableObject {
         return max(0, Int(milliseconds.rounded()))
     }
 
+    private func refreshInputDeviceName() {
+        if let preferredInputDeviceID,
+           let selectedOption = availableInputDevices.first(where: { $0.deviceID == preferredInputDeviceID }) {
+            currentInputDeviceName = selectedOption.name
+            return
+        }
+
+        currentInputDeviceName = Self.defaultInputDeviceName() ?? "Unknown Input"
+    }
+
+    private nonisolated static func defaultInputDeviceID() -> AudioDeviceID? {
+        var deviceID = AudioDeviceID(0)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+
+        let deviceStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceID
+        )
+        guard deviceStatus == noErr, deviceID != kAudioObjectUnknown else {
+            return nil
+        }
+        return deviceID
+    }
+
+    private nonisolated static func defaultInputDeviceName() -> String? {
+        guard let deviceID = defaultInputDeviceID() else {
+            return nil
+        }
+        return audioObjectStringProperty(selector: kAudioObjectPropertyName, objectID: deviceID)
+    }
+
+    private nonisolated static func availableInputDeviceOptions() -> [AudioInputDeviceOption] {
+        let defaultDeviceID = defaultInputDeviceID()
+        let devices = availableInputDeviceIDs()
+        let sortedDevices = devices.sorted { lhs, rhs in
+            let leftName = audioObjectStringProperty(selector: kAudioObjectPropertyName, objectID: lhs) ?? ""
+            let rightName = audioObjectStringProperty(selector: kAudioObjectPropertyName, objectID: rhs) ?? ""
+            return leftName.localizedCaseInsensitiveCompare(rightName) == .orderedAscending
+        }
+
+        var options: [AudioInputDeviceOption] = []
+        let defaultName = defaultInputDeviceName() ?? "Unknown Input"
+        options.append(
+            AudioInputDeviceOption(
+                deviceID: nil,
+                name: defaultName,
+                detail: "Uses the current macOS default input device.",
+                isSystemDefault: true
+            )
+        )
+
+        for deviceID in sortedDevices {
+            guard let name = audioObjectStringProperty(selector: kAudioObjectPropertyName, objectID: deviceID) else {
+                continue
+            }
+
+            let manufacturer = audioObjectStringProperty(selector: kAudioObjectPropertyManufacturer, objectID: deviceID)
+            let detail: String
+            if deviceID == defaultDeviceID {
+                if let manufacturer, !manufacturer.isEmpty {
+                    detail = "Default input • \(manufacturer)"
+                } else {
+                    detail = "Default input"
+                }
+            } else if let manufacturer, !manufacturer.isEmpty {
+                detail = manufacturer
+            } else {
+                detail = "Available input device"
+            }
+
+            options.append(
+                AudioInputDeviceOption(
+                    deviceID: deviceID,
+                    name: name,
+                    detail: detail,
+                    isSystemDefault: false
+                )
+            )
+        }
+        return options
+    }
+
+    private nonisolated static func availableInputDeviceIDs() -> [AudioDeviceID] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        let sizeStatus = AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size
+        )
+        guard sizeStatus == noErr, size > 0 else {
+            return []
+        }
+
+        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        var deviceIDs = Array(repeating: AudioDeviceID(0), count: count)
+        let dataStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceIDs
+        )
+        guard dataStatus == noErr else {
+            return []
+        }
+
+        return deviceIDs.filter { inputChannelCount(for: $0) > 0 }
+    }
+
+    private nonisolated static func inputChannelCount(for deviceID: AudioDeviceID) -> Int {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        let sizeStatus = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size)
+        guard sizeStatus == noErr, size > 0 else {
+            return 0
+        }
+
+        let rawPointer = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(size),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { rawPointer.deallocate() }
+
+        let dataStatus = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, rawPointer)
+        guard dataStatus == noErr else {
+            return 0
+        }
+
+        let bufferListPointer = rawPointer.assumingMemoryBound(to: AudioBufferList.self)
+        let bufferList = UnsafeMutableAudioBufferListPointer(bufferListPointer)
+        return bufferList.reduce(0) { $0 + Int($1.mNumberChannels) }
+    }
+
+    private nonisolated static func audioObjectStringProperty(
+        selector: AudioObjectPropertySelector,
+        objectID: AudioObjectID
+    ) -> String? {
+        var value: CFString = "" as CFString
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size = UInt32(MemoryLayout<CFString>.size)
+        let status = AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value)
+        guard status == noErr else {
+            return nil
+        }
+        let result = value as String
+        return result.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : result
+    }
+
+    private nonisolated static func inputLevelSummary(for buffer: AVAudioPCMBuffer) -> String? {
+        guard let peak = peakLevel(for: buffer) else { return nil }
+
+        let clamped = max(0.0, min(peak, 1.0))
+        let percent = clamped * 100.0
+        if percent < 10.0 {
+            return String(format: "Peak %.1f%%", percent)
+        }
+        return "Peak \(Int(percent.rounded()))%"
+    }
+
+    private func lowSignalMessage(for buffers: [AVAudioPCMBuffer]) -> String? {
+        let peak = buffers.compactMap(Self.peakLevel(for:)).max() ?? 0.0
+        guard peak < 0.01 else {
+            return nil
+        }
+        return String(
+            format: "Mic signal too low on %@. Peak %.1f%%. Choose a different input device or raise the input level.",
+            currentInputDeviceName,
+            peak * 100.0
+        )
+    }
+
+    private nonisolated static func peakLevel(for buffer: AVAudioPCMBuffer) -> Double? {
+        switch buffer.format.commonFormat {
+        case .pcmFormatFloat32:
+            guard let channels = buffer.floatChannelData else { return nil }
+            let frameCount = Int(buffer.frameLength)
+            guard frameCount > 0 else { return 0.0 }
+            let samples = UnsafeBufferPointer(start: channels[0], count: frameCount)
+            return samples.reduce(0.0) { current, sample in
+                max(current, abs(Double(sample)))
+            }
+
+        case .pcmFormatInt16:
+            guard let channels = buffer.int16ChannelData else { return nil }
+            let frameCount = Int(buffer.frameLength)
+            guard frameCount > 0 else { return 0.0 }
+            let samples = UnsafeBufferPointer(start: channels[0], count: frameCount)
+            return samples.reduce(0.0) { current, sample in
+                max(current, abs(Double(sample) / Double(Int16.max)))
+            }
+
+        default:
+            return nil
+        }
+    }
+
     private func playStartSound() {
         if let sound = NSSound(named: NSSound.Name("Tink")) {
             sound.play()
@@ -945,6 +1577,8 @@ public final class AppState: ObservableObject {
             statusLine = "Idle"
         case .listening:
             statusLine = "Listening..."
+        case .recordingAudio:
+            statusLine = "Recording audio..."
         case .finalizingTranscript:
             statusLine = "Finalizing transcript..."
         case .cleaning:
@@ -966,10 +1600,120 @@ public final class AppState: ObservableObject {
         transition(to: .error(message))
     }
 
+    public var hasLatestCapturedAudio: Bool {
+        latestCapturedAudioURL != nil
+    }
+
+    public func toggleLatestCapturedAudioPlayback() {
+        if latestCapturedAudioIsPlaying {
+            stopLatestCapturedAudioPlayback()
+        } else {
+            playLatestCapturedAudio()
+        }
+    }
+
+    public func playLatestCapturedAudio() {
+        guard let latestCapturedAudioURL else { return }
+
+        do {
+            audioPreviewPlayer?.stop()
+            let player = try AVAudioPlayer(contentsOf: latestCapturedAudioURL)
+            audioPreviewPlayer = player
+            player.play()
+            latestCapturedAudioIsPlaying = true
+
+            let playbackDuration = player.duration
+            Task { @MainActor [weak self] in
+                guard playbackDuration > 0 else { return }
+                try? await Task.sleep(nanoseconds: UInt64(playbackDuration * 1_000_000_000))
+                guard let self, self.audioPreviewPlayer === player else { return }
+                self.latestCapturedAudioIsPlaying = player.isPlaying
+            }
+        } catch {
+            DebugLog.write("[AppState] failed to play latest captured audio: \(error.localizedDescription)")
+            latestCapturedAudioIsPlaying = false
+            audioPreviewPlayer = nil
+        }
+    }
+
+    public func stopLatestCapturedAudioPlayback() {
+        audioPreviewPlayer?.stop()
+        latestCapturedAudioIsPlaying = false
+    }
+
+    public func revealLatestDebugCaptureInFinder() {
+        guard let latestDebugCaptureDirectoryURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([latestDebugCaptureDirectoryURL])
+    }
+
     private func copyToPasteboard(_ text: String) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
+    }
+
+    private struct DebugCaptureMetadata: Encodable {
+        let createdAt: Date
+        let mode: String
+        let inputDeviceName: String
+        let inputLevel: String
+        let audioPath: String
+        let startContext: DebugContextPayload?
+        let contextualHints: [String]
+        let result: DebugCaptureResultPayload
+        let stopPath: StopPathDetails?
+    }
+
+    private struct DebugCaptureResultPayload: Encodable {
+        let kind: String
+        let rawText: String?
+        let cleanedText: String?
+        let error: String?
+        let warning: String?
+        let latency: PipelineLatency
+    }
+
+    private struct DebugContextPayload: Encodable {
+        let appName: String
+        let bundleIdentifier: String
+        let surface: String
+        let windowTitle: String
+        let projectName: String?
+        let projectPathHint: String?
+        let activeDocumentHint: String?
+        let browserTabHint: String?
+        let browserURL: String?
+        let browserHost: String?
+        let browserPathHint: String?
+    }
+
+    private static func debugContextPayload(from context: DictationAppContext) -> DebugContextPayload {
+        DebugContextPayload(
+            appName: context.appName,
+            bundleIdentifier: context.bundleIdentifier,
+            surface: context.surface.rawValue,
+            windowTitle: context.windowTitle,
+            projectName: context.projectName,
+            projectPathHint: context.projectPathHint,
+            activeDocumentHint: context.activeDocumentHint,
+            browserTabHint: context.browserTabHint,
+            browserURL: context.browserURL,
+            browserHost: context.browserHost,
+            browserPathHint: context.browserPathHint
+        )
+    }
+
+    private static func debugContextSummary(_ context: DictationAppContext) -> String {
+        [
+            "app=\(context.appName)",
+            "surface=\(context.surface.rawValue)",
+            "project=\(context.projectName ?? "nil")",
+            "file=\(context.activeDocumentHint ?? "nil")",
+            "browserTab=\(context.browserTabHint ?? "nil")",
+            "browserURL=\(context.browserURL ?? "nil")",
+            "browserHost=\(context.browserHost ?? "nil")",
+            "browserPath=\(context.browserPathHint ?? "nil")"
+        ].joined(separator: " ")
     }
 }
 

@@ -150,6 +150,8 @@ public enum HotkeyMonitorError: LocalizedError {
 
 public final class HotkeyMonitor: @unchecked Sendable, HotkeyMonitoring {
     public var onToggleRequested: (@MainActor () -> Void)?
+    public var onStartRequested: (@MainActor () -> Void)?
+    public var onStopRequested: (@MainActor () -> Void)?
 
     private enum CommandTransition {
         case down

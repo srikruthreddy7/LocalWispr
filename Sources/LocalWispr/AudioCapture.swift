@@ -1,4 +1,6 @@
 @preconcurrency import AVFAudio
+import AudioToolbox
+import CoreAudio
 import Foundation
 
 public enum AudioCaptureError: LocalizedError {
@@ -6,6 +8,7 @@ public enum AudioCaptureError: LocalizedError {
     case engineNotRunning
     case cannotCreateBuffer
     case conversionFailed(String)
+    case deviceSelectionFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -17,6 +20,8 @@ public enum AudioCaptureError: LocalizedError {
             return "Unable to allocate audio buffer."
         case .conversionFailed(let details):
             return "Unable to convert microphone audio: \(details)"
+        case .deviceSelectionFailed(let details):
+            return "Unable to use the selected microphone: \(details)"
         }
     }
 }
@@ -30,12 +35,13 @@ public final class AudioCapture: @unchecked Sendable, AudioCapturing {
     private let bufferQueue = DispatchQueue(label: "LocalWispr.AudioCapture.buffer")
 
     private var isRunning = false
+    private var capturedBufferCount = 0
     private var bufferedAudio: [AVAudioPCMBuffer] = []
     private var capturedBufferHandler: (@Sendable (AVAudioPCMBuffer) -> Void)?
 
     private let targetFormat: AVAudioFormat = {
         AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
+            commonFormat: .pcmFormatFloat32,
             sampleRate: 16_000,
             channels: 1,
             interleaved: false
@@ -47,6 +53,8 @@ public final class AudioCapture: @unchecked Sendable, AudioCapturing {
     public var outputAudioFormat: AVAudioFormat {
         targetFormat
     }
+
+    public var preferredInputDeviceID: UInt32?
 
     public var onBufferCaptured: (@Sendable (AVAudioPCMBuffer) -> Void)? {
         get {
@@ -64,9 +72,12 @@ public final class AudioCapture: @unchecked Sendable, AudioCapturing {
             }
 
             bufferedAudio.removeAll(keepingCapacity: true)
+            capturedBufferCount = 0
 
             let inputNode = engine.inputNode
+            try self.configureInputDevice(for: inputNode)
             let inputFormat = inputNode.outputFormat(forBus: 0)
+            DebugLog.write("[AudioCapture] inputDevice=\(preferredInputDeviceID.map(String.init) ?? "system-default") inputFormat=\(inputFormat) targetFormat=\(targetFormat)")
 
             inputNode.removeTap(onBus: 0)
             inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
@@ -106,6 +117,12 @@ public final class AudioCapture: @unchecked Sendable, AudioCapturing {
 
             do {
                 let normalized = try self.normalizeToTargetFormat(inputBuffer)
+                self.capturedBufferCount += 1
+                if self.capturedBufferCount <= 3 || self.capturedBufferCount.isMultiple(of: 50) {
+                    DebugLog.write(
+                        "[AudioCapture] buffer #\(self.capturedBufferCount) raw=\(Self.describeLevel(inputBuffer)) normalized=\(Self.describeLevel(normalized))"
+                    )
+                }
                 self.bufferedAudio.append(normalized)
                 self.capturedBufferHandler?(normalized)
             } catch {
@@ -212,5 +229,56 @@ public final class AudioCapture: @unchecked Sendable, AudioCapturing {
         }
 
         return copy
+    }
+
+    private func configureInputDevice(for inputNode: AVAudioInputNode) throws {
+        guard let preferredInputDeviceID else { return }
+        guard let audioUnit = inputNode.audioUnit else {
+            throw AudioCaptureError.deviceSelectionFailed("audio unit unavailable")
+        }
+
+        var deviceID = AudioDeviceID(preferredInputDeviceID)
+        let status = AudioUnitSetProperty(
+            audioUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &deviceID,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+
+        guard status == noErr else {
+            throw AudioCaptureError.deviceSelectionFailed("OSStatus \(status)")
+        }
+    }
+
+    private static func describeLevel(_ buffer: AVAudioPCMBuffer) -> String {
+        let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else { return "empty" }
+
+        switch buffer.format.commonFormat {
+        case .pcmFormatFloat32:
+            guard let channels = buffer.floatChannelData else { return "unavailable" }
+            let samples = UnsafeBufferPointer(start: channels[0], count: frameCount)
+            let rms = sqrt(samples.reduce(0.0) { $0 + Double($1 * $1) } / Double(frameCount))
+            let peak = samples.reduce(0.0) { max($0, Double(abs($1))) }
+            return String(format: "float rms=%.5f peak=%.5f", rms, peak)
+
+        case .pcmFormatInt16:
+            guard let channels = buffer.int16ChannelData else { return "unavailable" }
+            let samples = UnsafeBufferPointer(start: channels[0], count: frameCount)
+            let scale = Double(Int16.max)
+            let rms = sqrt(samples.reduce(0.0) { partial, sample in
+                let normalized = Double(sample) / scale
+                return partial + (normalized * normalized)
+            } / Double(frameCount))
+            let peak = samples.reduce(0.0) { partial, sample in
+                max(partial, abs(Double(sample) / scale))
+            }
+            return String(format: "int16 rms=%.5f peak=%.5f", rms, peak)
+
+        default:
+            return "unsupported"
+        }
     }
 }

@@ -8,7 +8,7 @@ public actor Pipeline {
     private let inserter: any Inserting
 
     public init(
-        cleaner: any Cleaning = TextCleaner(),
+        cleaner: any Cleaning = AdaptiveTextCleaner(),
         inserter: any Inserting = TextInserter()
     ) {
         self.cleaner = cleaner
@@ -26,7 +26,7 @@ public actor Pipeline {
         var insertionDuration: Duration = .zero
 
         let normalizedRaw = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedRaw.isEmpty else {
+        guard !normalizedRaw.isEmpty, Self.containsSubstantiveContent(normalizedRaw) else {
             let latency = Self.makeLatency(
                 stopToTranscriptMilliseconds: stopToTranscriptMilliseconds,
                 cleanupDuration: cleanupDuration,
@@ -38,7 +38,6 @@ public actor Pipeline {
         }
 
         var cleanedText = normalizedRaw
-        var warning: String?
 
         switch cleaner.availability {
         case .available:
@@ -46,21 +45,68 @@ public actor Pipeline {
             let cleanupStartedAt = clock.now
             do {
                 let candidate = try await cleaner.clean(normalizedRaw).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !candidate.isEmpty {
-                    cleanedText = candidate
+                cleanupDuration = cleanupStartedAt.duration(to: clock.now)
+                guard !candidate.isEmpty else {
+                    let latency = Self.makeLatency(
+                        stopToTranscriptMilliseconds: stopToTranscriptMilliseconds,
+                        cleanupDuration: cleanupDuration,
+                        insertionDuration: insertionDuration,
+                        recordingDurationMilliseconds: recordingDurationMilliseconds
+                    )
+                    Self.logLatency(latency, outcome: "cleanup_failed")
+                    return .failed(
+                        raw: normalizedRaw,
+                        cleaned: nil,
+                        error: "Text cleanup failed: Cleanup returned empty output",
+                        latency: latency
+                    )
                 }
-                cleanupDuration = cleanupStartedAt.duration(to: clock.now)
+                cleanedText = candidate
             } catch let error as TextCleanerError {
-                warning = error.errorDescription ?? "Cleanup failed; inserting raw transcript instead."
-                cleanedText = normalizedRaw
                 cleanupDuration = cleanupStartedAt.duration(to: clock.now)
+                let latency = Self.makeLatency(
+                    stopToTranscriptMilliseconds: stopToTranscriptMilliseconds,
+                    cleanupDuration: cleanupDuration,
+                    insertionDuration: insertionDuration,
+                    recordingDurationMilliseconds: recordingDurationMilliseconds
+                )
+                Self.logLatency(latency, outcome: "cleanup_failed")
+                return .failed(
+                    raw: normalizedRaw,
+                    cleaned: nil,
+                    error: error.errorDescription ?? "Text cleanup failed.",
+                    latency: latency
+                )
             } catch {
-                warning = "Cleanup failed; inserting raw transcript instead."
-                cleanedText = normalizedRaw
                 cleanupDuration = cleanupStartedAt.duration(to: clock.now)
+                let latency = Self.makeLatency(
+                    stopToTranscriptMilliseconds: stopToTranscriptMilliseconds,
+                    cleanupDuration: cleanupDuration,
+                    insertionDuration: insertionDuration,
+                    recordingDurationMilliseconds: recordingDurationMilliseconds
+                )
+                Self.logLatency(latency, outcome: "cleanup_failed")
+                return .failed(
+                    raw: normalizedRaw,
+                    cleaned: nil,
+                    error: "Text cleanup failed: \(error.localizedDescription)",
+                    latency: latency
+                )
             }
         case .unavailable(let reason):
-            warning = "Cleanup unavailable (\(reason)); inserted raw transcript."
+            let latency = Self.makeLatency(
+                stopToTranscriptMilliseconds: stopToTranscriptMilliseconds,
+                cleanupDuration: cleanupDuration,
+                insertionDuration: insertionDuration,
+                recordingDurationMilliseconds: recordingDurationMilliseconds
+            )
+            Self.logLatency(latency, outcome: "cleanup_unavailable")
+            return .failed(
+                raw: normalizedRaw,
+                cleaned: nil,
+                error: "Text cleanup unavailable: \(reason)",
+                latency: latency
+            )
         }
 
         stageHandler?(.inserting)
@@ -93,7 +139,7 @@ public actor Pipeline {
             recordingDurationMilliseconds: recordingDurationMilliseconds
         )
         Self.logLatency(latency, outcome: "inserted")
-        return .inserted(raw: normalizedRaw, cleaned: cleanedText, warning: warning, latency: latency)
+        return .inserted(raw: normalizedRaw, cleaned: cleanedText, warning: nil, latency: latency)
     }
 
     private static func makeLatency(
@@ -114,6 +160,12 @@ public actor Pipeline {
         let components = duration.components
         let milliseconds = (Double(components.seconds) * 1_000.0) + (Double(components.attoseconds) / 1_000_000_000_000_000.0)
         return max(0, Int(milliseconds.rounded()))
+    }
+
+    private static func containsSubstantiveContent(_ text: String) -> Bool {
+        text.unicodeScalars.contains { scalar in
+            CharacterSet.alphanumerics.contains(scalar)
+        }
     }
 
     private static func logLatency(_ latency: PipelineLatency, outcome: StaticString) {
