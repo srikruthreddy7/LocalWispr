@@ -27,6 +27,14 @@ playground.xcworkspace
 # Logs
 *.log
 
+# Python bytecode / caches (local only)
+**/__pycache__/
+*.py[cod]
+
+# Local Modal smoke / scratch outputs under tools/ (never commit)
+tools/modal-*-check.json
+tools/modal-smoke*
+
 # Optional local install / packaging (DMGs and staged app bundles)
 dist/
 *.dmg
