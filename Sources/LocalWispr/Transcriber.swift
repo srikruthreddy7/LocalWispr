@@ -191,6 +191,74 @@ private final class LegacyRecognitionBridge: @unchecked Sendable {
     }
 }
 
+private final class BufferedCloudTranscriptionSession: @unchecked Sendable, LiveTranscriptionSession {
+    private let transcribe: @Sendable ([Float]) async throws -> String
+    private let stateLock = NSLock()
+    private var samples: [Float] = []
+    private var isFinished = false
+    private var isCancelled = false
+
+    init(transcribe: @escaping @Sendable ([Float]) async throws -> String) {
+        self.transcribe = transcribe
+    }
+
+    func append(_ buffer: AVAudioPCMBuffer) {
+        let converted = Self.convertToFloatSamples(buffer)
+        guard !converted.isEmpty else { return }
+
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !isFinished, !isCancelled else { return }
+        samples.append(contentsOf: converted)
+    }
+
+    func finish() async throws -> String {
+        let snapshot: [Float] = try withStateLock {
+            if isCancelled {
+                throw CancellationError()
+            }
+            isFinished = true
+            return samples
+        }
+
+        guard !snapshot.isEmpty else {
+            throw TranscriberError.emptyAudio
+        }
+        return try await transcribe(snapshot)
+    }
+
+    func cancel() async {
+        withStateLock {
+            isCancelled = true
+            samples.removeAll(keepingCapacity: false)
+        }
+    }
+
+    private static func convertToFloatSamples(_ buffer: AVAudioPCMBuffer) -> [Float] {
+        let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else { return [] }
+
+        switch buffer.format.commonFormat {
+        case .pcmFormatFloat32:
+            guard let channels = buffer.floatChannelData else { return [] }
+            return Array(UnsafeBufferPointer(start: channels[0], count: frameCount))
+        case .pcmFormatInt16:
+            guard let channels = buffer.int16ChannelData else { return [] }
+            let source = UnsafeBufferPointer(start: channels[0], count: frameCount)
+            let scale = Float(Int16.max)
+            return source.map { Float($0) / scale }
+        default:
+            return []
+        }
+    }
+
+    private func withStateLock<T>(_ body: () throws -> T) rethrows -> T {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return try body()
+    }
+}
+
 private final class GroqLiveTranscriptionSession: @unchecked Sendable, LiveTranscriptionSession {
     private let sampleRate: Double
     private let transcribeChunk: @Sendable ([Float], ClosedRange<Double>) async throws -> GroqVerboseTranscriptionResponse
@@ -831,7 +899,7 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
         _ = mode
         _ = locale
         _ = audioFormat
-        // Groq STT has no local warmup step.
+        // Modal-hosted STT has no local warmup step.
     }
 
     public func startSession(
@@ -841,44 +909,22 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
         contextualStrings: [String] = []
     ) async throws -> any LiveTranscriptionSession {
         let env = DotEnv.merged()
-        guard let apiKey = env["GROQ_API_KEY"], !apiKey.isEmpty else {
-            throw TranscriberError.cloudRecognitionFailed("Missing GROQ_API_KEY")
-        }
-
-        _ = apiKey
+        let config = try Self.modalSTTConfig(from: env)
         let prompt = Self.transcriptionPrompt(from: contextualStrings)
-        DebugLog.write("[Transcriber] using Groq Whisper live session locale=\(locale.identifier) mode=\(mode) inputFormat=\(audioFormat)")
+        DebugLog.write("[Transcriber] using Modal STT buffered session locale=\(locale.identifier) mode=\(mode) inputFormat=\(audioFormat)")
 
-        return GroqLiveTranscriptionSession(
-            sampleRate: audioFormat.sampleRate,
-            transcriptUpdateHandler: onLiveTranscriptUpdate,
-            transcribeChunk: { [weak self] samples, window in
-                guard let self else {
-                    throw CancellationError()
-                }
-
-                return try await self.transcribeChunkWithGroq(
-                    samples: samples,
-                    absoluteWindow: window,
-                    locale: locale,
-                    env: env,
-                    prompt: prompt
-                )
-            },
-            transcribeFull: { [weak self] samples in
-                guard let self else {
-                    throw CancellationError()
-                }
-
-                return try await self.transcribeSamplesWithGroq(
-                    samples: samples,
-                    locale: locale,
-                    env: env,
-                    prompt: prompt,
-                    responseFormat: .json
-                ).text
+        return BufferedCloudTranscriptionSession { [weak self] samples in
+            guard let self else {
+                throw CancellationError()
             }
-        )
+            let response = try await self.transcribeSamplesWithModal(
+                samples: samples,
+                locale: locale,
+                config: config,
+                prompt: prompt
+            )
+            return response.text
+        }
     }
 
     public func transcribe(
@@ -892,9 +938,43 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
         }
 
         let env = DotEnv.merged()
+        _ = try Self.modalSTTConfig(from: env)
         let prompt = Self.transcriptionPrompt(from: contextualStrings)
-        DebugLog.write("[Transcriber] using Groq Whisper batch locale=\(locale.identifier) mode=\(mode) buffers=\(buffers.count)")
-        return try await transcribeWithGroq(buffers: buffers, locale: locale, env: env, prompt: prompt)
+        DebugLog.write("[Transcriber] using Modal STT batch locale=\(locale.identifier) mode=\(mode) buffers=\(buffers.count)")
+        return try await transcribeWithModal(buffers: buffers, locale: locale, env: env, prompt: prompt)
+    }
+
+    private struct ModalSTTConfig {
+        let endpoint: URL
+        let apiKey: String
+        let model: String
+        let timeoutSeconds: TimeInterval
+    }
+
+    private static func modalSTTConfig(from env: [String: String]) throws -> ModalSTTConfig {
+        guard let endpointValue = env["LOCALWISPR_MODAL_STT_ENDPOINT"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !endpointValue.isEmpty,
+              let endpoint = URL(string: endpointValue) else {
+            throw TranscriberError.cloudRecognitionFailed("Missing LOCALWISPR_MODAL_STT_ENDPOINT")
+        }
+
+        guard let apiKey = env["LOCALWISPR_MODAL_STT_API_KEY"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !apiKey.isEmpty else {
+            throw TranscriberError.cloudRecognitionFailed("Missing LOCALWISPR_MODAL_STT_API_KEY")
+        }
+
+        let model = env["LOCALWISPR_MODAL_STT_MODEL"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedModel = (model?.isEmpty == false) ? model! : "openai/whisper-large-v3-turbo"
+
+        let timeoutValue = env["LOCALWISPR_MODAL_STT_TIMEOUT_SECONDS"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let timeoutSeconds = timeoutValue.flatMap(TimeInterval.init) ?? 60
+
+        return ModalSTTConfig(
+            endpoint: endpoint,
+            apiKey: apiKey,
+            model: resolvedModel,
+            timeoutSeconds: max(5, timeoutSeconds)
+        )
     }
 
     private static func transcriptionPrompt(from contextualStrings: [String]) -> String? {
@@ -1233,62 +1313,32 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
         }
     }
 
-    private func transcribeWithGroq(
+    private func transcribeWithModal(
         buffers: [AVAudioPCMBuffer],
         locale: Locale,
         env: [String: String],
         prompt: String? = nil
     ) async throws -> String {
+        let config = try Self.modalSTTConfig(from: env)
         let samples = Self.convertBuffersToFloatSamples(buffers)
         guard !samples.isEmpty else {
             throw TranscriberError.emptyAudio
         }
 
-        return try await transcribeSamplesWithGroq(
+        return try await transcribeSamplesWithModal(
             samples: samples,
             locale: locale,
-            env: env,
-            prompt: prompt,
-            responseFormat: .json
+            config: config,
+            prompt: prompt
         ).text
     }
 
-    private func transcribeChunkWithGroq(
+    private func transcribeSamplesWithModal(
         samples: [Float],
-        absoluteWindow: ClosedRange<Double>,
         locale: Locale,
-        env: [String: String],
+        config: ModalSTTConfig,
         prompt: String? = nil
     ) async throws -> GroqVerboseTranscriptionResponse {
-        let response = try await transcribeSamplesWithGroq(
-            samples: samples,
-            locale: locale,
-            env: env,
-            prompt: prompt,
-            responseFormat: .verboseJSON
-        )
-        DebugLog.write(
-            "[GroqSTTChunk] success start=\(String(format: "%.2f", absoluteWindow.lowerBound)) end=\(String(format: "%.2f", absoluteWindow.upperBound)) segments=\(response.segments?.count ?? 0) text=\(response.text.prefix(120))"
-        )
-        return response
-    }
-
-    private enum GroqResponseFormat: String {
-        case json = "json"
-        case verboseJSON = "verbose_json"
-    }
-
-    private func transcribeSamplesWithGroq(
-        samples: [Float],
-        locale: Locale,
-        env: [String: String],
-        prompt: String? = nil,
-        responseFormat: GroqResponseFormat
-    ) async throws -> GroqVerboseTranscriptionResponse {
-        guard let apiKey = env["GROQ_API_KEY"], !apiKey.isEmpty else {
-            throw TranscriberError.cloudRecognitionFailed("Missing GROQ_API_KEY")
-        }
-
         guard !samples.isEmpty else {
             throw TranscriberError.emptyAudio
         }
@@ -1307,25 +1357,15 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
             var body = Data()
             body.appendUTF8("--\(boundary)\r\n")
             body.appendUTF8("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
-            body.appendUTF8("whisper-large-v3-turbo\r\n")
+            body.appendUTF8("\(config.model)\r\n")
 
             body.appendUTF8("--\(boundary)\r\n")
             body.appendUTF8("Content-Disposition: form-data; name=\"language\"\r\n\r\n")
             body.appendUTF8("\(locale.language.languageCode?.identifier ?? "en")\r\n")
 
             body.appendUTF8("--\(boundary)\r\n")
-            body.appendUTF8("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n")
-            body.appendUTF8("\(responseFormat.rawValue)\r\n")
-
-            body.appendUTF8("--\(boundary)\r\n")
             body.appendUTF8("Content-Disposition: form-data; name=\"temperature\"\r\n\r\n")
             body.appendUTF8("0\r\n")
-
-            if responseFormat == .verboseJSON {
-                body.appendUTF8("--\(boundary)\r\n")
-                body.appendUTF8("Content-Disposition: form-data; name=\"timestamp_granularities[]\"\r\n\r\n")
-                body.appendUTF8("segment\r\n")
-            }
 
             if let prompt, !prompt.isEmpty {
                 body.appendUTF8("--\(boundary)\r\n")
@@ -1339,21 +1379,23 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
             body.append(audioData)
             body.appendUTF8("\r\n--\(boundary)--\r\n")
 
-            var request = URLRequest(url: URL(string: "https://api.groq.com/openai/v1/audio/transcriptions")!)
+            var request = URLRequest(url: config.endpoint)
             request.httpMethod = "POST"
-            request.timeoutInterval = 30
-            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            request.timeoutInterval = config.timeoutSeconds
+            request.setValue("Bearer \(config.apiKey)", forHTTPHeaderField: "Authorization")
             request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
             request.httpBody = body
 
-            DebugLog.write("[GroqSTT] uploading \(audioData.count) bytes")
+            let uploadStartedAt = Date()
+            DebugLog.write("[ModalSTT] uploading \(audioData.count) bytes model=\(config.model)")
             let (data, response) = try await URLSession.shared.data(for: request)
+            let uploadMilliseconds = Int((Date().timeIntervalSince(uploadStartedAt) * 1_000.0).rounded())
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw TranscriberError.cloudRecognitionFailed("Invalid HTTP response")
             }
             guard (200..<300).contains(httpResponse.statusCode) else {
                 let responseText = String(data: data, encoding: .utf8) ?? "<non-utf8>"
-                DebugLog.write("[GroqSTT] HTTP \(httpResponse.statusCode): \(responseText.prefix(300))")
+                DebugLog.write("[ModalSTT] HTTP \(httpResponse.statusCode): \(responseText.prefix(300))")
                 throw TranscriberError.cloudRecognitionFailed("HTTP \(httpResponse.statusCode)")
             }
 
@@ -1363,13 +1405,31 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
                 throw TranscriberError.cloudRecognitionFailed("Empty transcript")
             }
 
-            DebugLog.write("[GroqSTT] success text=\(transcript.prefix(120))")
+            let serverDecodeMs = Self.extractServerDecodeMilliseconds(from: data)
+            let audioSeconds = Double(samples.count) / 16_000.0
+            let textLength = transcript.count
+            DebugLog.write(
+                "[ModalSTT] success audioSeconds=\(String(format: "%.2f", audioSeconds)) uploadMs=\(uploadMilliseconds) serverDecodeMs=\(serverDecodeMs.map(String.init) ?? "n/a") textLength=\(textLength) text=\(transcript.prefix(120))"
+            )
             return decoded
         } catch let error as TranscriberError {
             throw error
         } catch {
             throw TranscriberError.cloudRecognitionFailed(error.localizedDescription)
         }
+    }
+
+    private static func extractServerDecodeMilliseconds(from data: Data) -> Int? {
+        guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        if let ms = payload["decode_ms"] as? Int {
+            return ms
+        }
+        if let metrics = payload["metrics"] as? [String: Any], let ms = metrics["decode_ms"] as? Int {
+            return ms
+        }
+        return nil
     }
 
     private func writeBuffers(_ buffers: [AVAudioPCMBuffer], toWavFileAt url: URL) throws {

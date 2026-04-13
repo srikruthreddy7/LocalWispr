@@ -7,10 +7,14 @@ final class TranscriberIntegrationTests: XCTestCase {
         var didProvideInput = false
     }
 
-    func testCloudFallbackTranscribesProvidedAudioFile() async throws {
+    func testModalSTTTranscribesProvidedAudioFile() async throws {
         let env = ProcessInfo.processInfo.environment
         guard let audioPath = env["LOCALWISPR_TRANSCRIBER_AUDIO"], !audioPath.isEmpty else {
             throw XCTSkip("LOCALWISPR_TRANSCRIBER_AUDIO not set")
+        }
+
+        guard env["LOCALWISPR_MODAL_STT_ENDPOINT"]?.isEmpty == false else {
+            throw XCTSkip("LOCALWISPR_MODAL_STT_ENDPOINT not set")
         }
 
         let url = URL(fileURLWithPath: audioPath)

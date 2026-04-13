@@ -1,156 +1,116 @@
-# LocalWispr — Architecture & decisions
+# LocalWispr Architecture
 
-This document describes how the app is structured, how data flows through it, and the main engineering choices. It reflects the **current** codebase, not a hypothetical plan.
+This document describes the current production flow in this repository.
 
 ---
 
-## High-level shape
+## System Overview
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  LocalWisprHost (AppKit + SwiftUI)                                 │
-│  MenuBarExtra + NSWindow (Control Panel)                          │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-┌────────────────────────────▼────────────────────────────────────┐
-│  AppState (@MainActor)                                           │
-│  Orchestrates: hotkey, audio, transcriber, pipeline, history, UI│
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-     ┌───────────────────────┼───────────────────────┐
-     ▼                       ▼                       ▼
-┌─────────────┐      ┌───────────────┐      ┌────────────────┐
-│ HotkeyMonitor│      │ AudioCapture  │      │ Transcriber   │
-│ (CGEvent tap)│      │ AVAudioEngine │      │ Parakeet EOU  │
-└─────────────┘      └───────┬───────┘      │ + Speech fallback │
-                             │      └───────┬───────────────┘
-                             │              │
-                             └──────┬───────┘
-                                    ▼
-                           ┌────────────────┐
-                           │ Pipeline       │
-                           │ TextCleaner +  │
-                           │ TextInserter   │
-                           └────────────────┘
+```mermaid
+flowchart LR
+  ui[LocalWisprHostUI] --> appState[AppState]
+  appState --> audioCapture[AudioCapture]
+  audioCapture --> transcriber[Transcriber]
+  transcriber --> modalStt[ModalSTTEndpoint]
+  modalStt --> transcriber
+  transcriber --> pipeline[Pipeline]
+  pipeline --> cleaner[ContextAwareCloudCleaner]
+  pipeline --> inserter[TextInserter]
 ```
 
 ---
 
-## Runtime entry
+## Runtime Entry
 
-- **`AppHost/LocalWisprHost/App.swift`** — `@main` SwiftUI `App` with a **`MenuBarExtra`** (menu bar UI) and **`NSApplicationDelegateAdaptor`** for the control panel window.
-- **`NSApplicationDelegate`** (`ControlPanelWindowController`) creates an **`NSWindow`** hosting **`ControlPanelView`** (SwiftUI). The app is an **`LSUIElement`** (no Dock icon by default).
-- **`AppState.shared.bootstrap()`** runs on launch: hotkey wiring, permission checks, optional accessibility alert, async history load, model prewarm, speech/mic permission refresh.
+- `AppHost/LocalWisprHost/App.swift` starts the menu-bar app and control panel host window.
+- `AppState.shared.bootstrap()` initializes hotkeys, permissions, history, and model prep state.
+- Dictation orchestration and state transitions are centralized in `AppState`.
 
 ---
 
-## Dictation lifecycle
+## Dictation Lifecycle
 
 ### Start
 
-1. User triggers **`toggleDictation()`** (hotkey or UI).
-2. **`ensurePermissionsForDictation()`** checks microphone + speech (and accessibility if hotkey requires it).
-3. **`Transcriber.startSession`** builds a **live** session (Parakeet EOU streaming on Apple Silicon when enabled; otherwise Apple speech live path).
-4. **`AudioCapture.start()`** begins capture; each buffer is forwarded to **`session.append(buffer)`**.
-5. State becomes **`.listening`**.
+1. User triggers `toggleDictation()`.
+2. `AppState` validates permissions.
+3. `Transcriber.startSession(...)` creates a **buffered session**.
+4. `AudioCapture` streams normalized 16k mono buffers to `session.append(...)`.
 
 ### Stop
 
-1. **Mic stops** and buffers are **drained** (for diagnostics and fallback).
-2. **Live session** is **`finish()`**-ed (with timeout). Result is the primary transcript string.
-3. If **no live** result but buffers exist, **`transcribe(buffers:)`** batch path runs.
-4. **`Pipeline.process`** runs (see below).
-5. **`handlePipelineResult`** updates UI, last latency, transcript history, status line.
+1. `AudioCapture.stopAndDrain()` stops the mic and returns captured buffers.
+2. `session.finish()` performs one STT request with full captured audio.
+3. The transcript is fed into `Pipeline.process(...)`.
+4. Cleanup and insertion complete, then history/latency stats are persisted.
+
+There is no chunked live transcript path in this flow; transcript output is returned after stop.
 
 ---
 
-## Pipeline (post-transcription)
+## STT (Modal Whisper)
 
-**`Pipeline`** is an actor that:
+- STT client implementation lives in `Sources/LocalWispr/Transcriber.swift`.
+- The app sends one multipart upload to a Modal endpoint per utterance.
+- Expected endpoint shape: `POST /v1/audio/transcriptions` returning JSON with at least `text`.
+- Required env vars:
+  - `LOCALWISPR_MODAL_STT_ENDPOINT`
+  - `LOCALWISPR_MODAL_STT_API_KEY`
+- Optional env vars:
+  - `LOCALWISPR_MODAL_STT_MODEL` (default `openai/whisper-large-v3-turbo`)
+  - `LOCALWISPR_MODAL_STT_TIMEOUT_SECONDS` (default `60`)
 
-1. **Normalizes** raw text; empty → **`.noSpeech`** with latency metrics.
-2. **Cleanup** — **`TextCleaner`** (`Cleaning` protocol) using **Foundation Models / Apple Intelligence** when available. On failure or unavailability, **raw** text is used and optional warnings are recorded.
-3. **Insertion** — **`TextInserter`** (`Inserting` protocol):
-   - Prefer **Accessibility** direct insertion into the focused element when possible.
-   - Else **pasteboard** + **simulated Cmd+V** to the frontmost app (with pasteboard restore).
-
-**Important:** Today, **cleanup completes before insertion** in a single `process` call. The pipeline records **stop-to-transcript**, **cleanup**, and **insertion** durations separately.
-
----
-
-## Transcription
-
-- **`Transcriber`** prefers **Parakeet Flash via FluidAudio** for low-latency local streaming on Apple Silicon.
-- Live path uses incremental streaming decode during capture and final flush on stop.
-- Fallback path remains Apple Speech (`SpeechAnalyzer` / legacy recognizer), then optional cloud STT fallback when enabled.
-- **Prewarm** (`prewarmModels`) warms both modes on boot to reduce first-session latency.
-- **Modes** (`TranscriberMode`): **dictationLong** vs **speechTranscription** — different analyzer presets for long dictation vs speech-style transcription.
-- **Fallback:** If live finalization fails or times out, buffered audio can be processed with a **batch** transcribe path.
+`Transcriber` logs metrics to `/tmp/localwispr-debug.log` including:
+- `audioSeconds`
+- `uploadMs`
+- `serverDecodeMs` (if returned by service payload)
+- `textLength`
 
 ---
 
-## Text cleanup
+## Cleanup + Insertion Pipeline
 
-- **`TextCleaner`** (`FoundationModels`) applies an LLM prompt for formatting/punctuation; includes **regex sanitization** (code fences, filler words, bullet handling, etc.) when needed.
-- **Availability** is checked at runtime; if Apple Intelligence is unavailable, cleanup may be skipped with a clear reason.
-
----
-
-## Hotkeys
-
-- **`HotkeyMonitor`** + **`HotkeyFactory`** install a **CGEvent tap** (or equivalent) for global shortcuts.
-- **`GlobalHotkeyBinding`** is persisted in **UserDefaults**; changing it recreates the monitor.
-- Some bindings require **Accessibility**; others may use different event paths — see `HotkeyFactory` and `HotkeyMonitor`.
-
----
-
-## UI
-
-- **Menu bar** — `MenuBarView` + status icon.
-- **Control panel** — `ControlPanelView`: Dashboard (grid of cards), History (`TranscriptHistoryView`), Settings.
-- **Layout** — Sidebar + main area; GeometryReader-based height for short windows; **custom button styles** (`solidProminent`, `subtleGlass`) replace system glass styles so controls **do not dim** when the window is not key.
-- **Hosting** — `NSHostingView` with `intrinsicContentSize` set to no intrinsic metric and low content hugging so the root fills the window (avoids sidebar height shrinking with tab content).
+- `Pipeline` runs:
+  1. Transcript normalization.
+  2. Cleanup via `Cleaning` implementation (`AdaptiveTextCleaner`/`ContextAwareCloudCleaner` path).
+  3. Text insertion via `TextInserter`.
+- `PipelineLatency` tracks:
+  - stop-to-transcript
+  - cleanup
+  - insertion
+  - total stop-to-insert
 
 ---
 
-## Persistence
+## UI and Persistence
 
-- **`TranscriptHistoryStore`** — local transcript records (paths and format in that source file).
-- **UserDefaults** — hotkey binding, transcriber mode, etc.
-
----
-
-## Testing
-
-- **`Tests/LocalWisprTests/`** — unit tests for `TextCleaner`, pipeline assembly, transcript assembly, latency stats, hotkey detector, etc.
-- `AppState` is injectable in tests where needed (see initializers).
+- UI: `MenuBarView`, `ControlPanelView`, settings/history dashboards.
+- Persistence:
+  - `TranscriptHistoryStore` for transcript records.
+  - `UserDefaults` for hotkeys and app preferences.
 
 ---
 
-## Product decisions (summary)
+## Testing and Evaluation
 
-| Decision | Rationale |
-|----------|-----------|
-| **Local-only default path** | Privacy and no cloud dependency for core dictation. |
-| **Menu bar + optional control panel** | Always-available control without cluttering the Dock (`LSUIElement`). |
-| **Live session + batch fallback** | Best latency when possible; robustness when live finalization fails. |
-| **Cleanup before insert** | Simpler correctness: user sees inserted text match “final” cleaned output when insertion succeeds. |
-| **AX + paste fallback** | Maximizes compatibility across apps that don’t expose AX text APIs. |
-| **Custom button styles** | System `.glass` styles dim when the window is inactive; custom styles keep contrast stable. |
+- Unit/integration tests: `Tests/LocalWisprTests`.
+- STT integration: `TranscriberIntegrationTests` with `LOCALWISPR_TRANSCRIBER_AUDIO`.
+- Manual evaluation:
+  - `ManualEvalTests.testModalSTTOnEvalSet()` compares transcript WER against references.
+  - outputs include audio duration, stop-to-transcript timing, and transcript size.
 
 ---
 
-## Latency SLO
+## SLO
 
-Hard product target for end-to-end latency from user stop action to final text inserted into target app:
+End-to-end latency target from stop action to final inserted text:
 
-- **p90 < 1.0s**
-- **p99 <= 1.5s**
-
-This SLO includes transcription, cleanup, and insertion.
+- p90 `< 1.0s`
+- p99 `<= 1.5s`
 
 ---
 
-## Related
+## Related Docs
 
-- **[ROADMAP.md](ROADMAP.md)** — Future ideas (e.g. sub-300ms stop-to-text explorations).
+- `docs/MODAL-STT.md`
+- `docs/ROADMAP.md`

@@ -50,6 +50,63 @@ final class ManualEvalTests: XCTestCase {
         XCTAssertFalse(summaries.isEmpty)
     }
 
+    func testModalSTTOnEvalSet() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let evalDir = env["LOCALWISPR_EVAL_DIR"], !evalDir.isEmpty else {
+            throw XCTSkip("LOCALWISPR_EVAL_DIR not set")
+        }
+        guard env["LOCALWISPR_MODAL_STT_ENDPOINT"]?.isEmpty == false else {
+            throw XCTSkip("LOCALWISPR_MODAL_STT_ENDPOINT not set")
+        }
+
+        let rootURL = URL(fileURLWithPath: evalDir, isDirectory: true)
+        let clips = try Self.discoverClips(in: rootURL)
+        guard !clips.isEmpty else {
+            throw XCTSkip("No eval clips found in \(evalDir)")
+        }
+
+        let transcriber = Transcriber()
+        var summaries: [String] = []
+
+        for clip in clips {
+            let buffers = try Self.loadTargetBuffers(from: clip.audioURL)
+            let started = Date()
+            let transcript = try await transcriber.transcribe(
+                buffers: buffers,
+                mode: .dictationLong,
+                locale: Locale(identifier: "en_US"),
+                contextualStrings: []
+            )
+            let stopToTranscriptMilliseconds = Int((Date().timeIntervalSince(started) * 1_000.0).rounded())
+
+            let normalizedPredicted = Self.normalize(transcript)
+            let normalizedReference = Self.normalize(clip.referenceText)
+            let wer = Self.wordErrorRate(reference: normalizedReference, hypothesis: normalizedPredicted)
+            let sampleCount = buffers.reduce(0) { $0 + Int($1.frameLength) }
+            let audioSeconds = Double(sampleCount) / 16_000.0
+
+            let summary = """
+            FILE: \(clip.audioURL.lastPathComponent)
+            AUDIO_SECONDS: \(String(format: "%.2f", audioSeconds))
+            STOP_TO_TRANSCRIPT_MS: \(stopToTranscriptMilliseconds)
+            TEXT_LENGTH: \(transcript.count)
+            REF: \(clip.referenceText)
+            HYP: \(transcript)
+            WER: \(String(format: "%.3f", wer))
+            """
+            summaries.append(summary)
+        }
+
+        print("LOCALWISPR_MODAL_EVAL_RESULTS_BEGIN")
+        for summary in summaries {
+            print(summary)
+            print("---")
+        }
+        print("LOCALWISPR_MODAL_EVAL_RESULTS_END")
+
+        XCTAssertFalse(summaries.isEmpty)
+    }
+
     private struct EvalClip {
         let audioURL: URL
         let referenceText: String
@@ -180,6 +237,71 @@ final class ManualEvalTests: XCTestCase {
         }
 
         return Array(UnsafeBufferPointer(start: channels[0], count: Int(normalizedBuffer.frameLength)))
+    }
+
+    private static func loadTargetBuffers(from url: URL) throws -> [AVAudioPCMBuffer] {
+        let file = try AVAudioFile(forReading: url)
+        let sourceFormat = file.processingFormat
+        let targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        )!
+        let chunkFrames = AVAudioFrameCount(16_000)
+        var buffers: [AVAudioPCMBuffer] = []
+
+        while true {
+            guard let sourceBuffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: chunkFrames) else {
+                throw NSError(domain: "ManualEvalTests", code: -10, userInfo: [NSLocalizedDescriptionKey: "Unable to allocate source buffer"])
+            }
+            try file.read(into: sourceBuffer, frameCount: chunkFrames)
+            if sourceBuffer.frameLength == 0 {
+                break
+            }
+
+            if sourceFormat.sampleRate == targetFormat.sampleRate,
+               sourceFormat.channelCount == targetFormat.channelCount,
+               sourceFormat.commonFormat == targetFormat.commonFormat,
+               sourceFormat.isInterleaved == targetFormat.isInterleaved {
+                buffers.append(sourceBuffer)
+                continue
+            }
+
+            guard let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
+                throw NSError(domain: "ManualEvalTests", code: -11, userInfo: [NSLocalizedDescriptionKey: "Unable to create converter"])
+            }
+
+            let ratio = targetFormat.sampleRate / sourceFormat.sampleRate
+            let capacity = AVAudioFrameCount((Double(sourceBuffer.frameLength) * ratio).rounded(.up)) + 32
+            guard let convertedBuffer = AVAudioPCMBuffer(
+                pcmFormat: targetFormat,
+                frameCapacity: max(capacity, 64)
+            ) else {
+                throw NSError(domain: "ManualEvalTests", code: -12, userInfo: [NSLocalizedDescriptionKey: "Unable to allocate converted buffer"])
+            }
+
+            let conversionState = ConversionState()
+            var conversionError: NSError?
+            let status = converter.convert(to: convertedBuffer, error: &conversionError) { _, outStatus in
+                if conversionState.didProvideInput {
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+
+                conversionState.didProvideInput = true
+                outStatus.pointee = .haveData
+                return sourceBuffer
+            }
+
+            if status == .error || convertedBuffer.frameLength == 0 {
+                throw conversionError ?? NSError(domain: "ManualEvalTests", code: -13, userInfo: [NSLocalizedDescriptionKey: "Audio conversion failed"])
+            }
+
+            buffers.append(convertedBuffer)
+        }
+
+        return buffers
     }
 
     private static func normalize(_ text: String) -> String {

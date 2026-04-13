@@ -1,8 +1,6 @@
 # LocalWispr
 
-**LocalWispr** is a macOS app for **local voice dictation**: it captures speech with the microphone, transcribes on-device with **Parakeet Flash (FluidAudio)** on Apple Silicon (with Apple speech fallback), optionally **cleans** text with **Apple Intelligence** (Foundation Models), and **inserts** the result at the cursor in the frontmost app.
-
-There are no cloud services in the default path—audio and models stay on your Mac, subject to local ASR and system APIs.
+**LocalWispr** is a macOS app for voice dictation: it captures speech with the microphone, transcribes with a **Modal-hosted Whisper large-v3-turbo** service (after-stop transcription), cleans text with a cloud LLM cleanup step, and inserts the result at the cursor in the frontmost app.
 
 ---
 
@@ -31,8 +29,8 @@ To **build the DMG yourself** or **cut a release**, see **[docs/RELEASE.md](docs
 ## Features
 
 - **Global shortcut** to start/stop dictation (configurable; default includes options such as Right ⌘ double-tap).
-- **Live transcription session** using **Parakeet Flash (FluidAudio EOU streaming)** on Apple Silicon with incremental chunk processing.
-- **Fallback path** to Apple Speech (`SpeechAnalyzer` / legacy recognizer) and optional cloud STT fallback when explicitly enabled.
+- **After-stop transcription UX**: one utterance upload after stop, one final transcript response.
+- **Modal STT backend** built around Whisper large-v3-turbo on a dedicated L40S-class GPU.
 - **Two transcriber modes**: Dictation (long-form) and Transcription (speech-oriented), user-selectable in Settings.
 - **Text cleanup** via `TextCleaner` (Apple Intelligence when available), with deterministic fallbacks and guardrail handling.
 - **Insertion** via Accessibility (direct text insertion when possible) or pasteboard + simulated paste.
@@ -102,18 +100,21 @@ swift test
 
 ---
 
-## ASR backend selection
+## STT backend configuration
 
-- Default behavior: prefer **Parakeet Flash** on Apple Silicon for English locales.
-- Override with environment variable:
-  - `LOCALWISPR_ASR_BACKEND=parakeet`
-  - `LOCALWISPR_ASR_BACKEND=apple`
+Set these environment variables (or `.env`) for STT:
+
+- `LOCALWISPR_MODAL_STT_ENDPOINT` — full URL to your Modal transcription endpoint (`/v1/audio/transcriptions`).
+- `LOCALWISPR_MODAL_STT_API_KEY` — bearer token expected by the Modal service.
+- `LOCALWISPR_MODAL_STT_MODEL` — optional; defaults to `openai/whisper-large-v3-turbo`.
+- `LOCALWISPR_MODAL_STT_TIMEOUT_SECONDS` — optional request timeout; defaults to `60`.
 
 ---
 
 ## Documentation
 
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Components, data flow, permissions, and product/technical decisions.
+- **[docs/MODAL-STT.md](docs/MODAL-STT.md)** — Modal deployment, secrets, benchmark workflow, and rollback path.
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — Future ideas (e.g. latency optimization directions), not a commitment.
 - **[docs/RELEASE.md](docs/RELEASE.md)** — Building the downloadable DMG, checksums, and GitHub Releases.
 
@@ -123,7 +124,7 @@ swift test
 
 - **Microphone** and **Speech Recognition** are used only for dictation; see `Info.plist` usage strings.
 - **Accessibility** is used to register global hotkeys and to insert or paste text into other applications.
-- Transcript history is stored **locally**; no network upload is implemented in the core paths described here.
+- Transcript history is stored **locally**. Captured utterance audio is uploaded to your configured Modal STT endpoint for transcription.
 
 Review entitlements in `AppHost/LocalWisprHost/LocalWisprHost.entitlements` before shipping your own build.
 
