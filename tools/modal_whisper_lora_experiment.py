@@ -89,6 +89,7 @@ class TrainConfig:
     recipe: str = "baseline"
     base_model: str = BASE_MODEL
     attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION
+    target_module_set: str = "full"
     train_dataset: DatasetConfig = field(
         default_factory=lambda: DatasetConfig(
             name="WillHeld/india_accent_cv",
@@ -124,6 +125,9 @@ class TrainConfig:
     save_total_limit: int = 2
     train_max_samples: int | None = None
     anchor_max_samples: int | None = None
+    focus_max_samples: int | None = None
+    focus_oversample_repeats: int = 0
+    focus_short_word_threshold: int = 5
     validation_max_samples: int | None = None
     svarah_max_samples: int | None = None
     normalize_transcripts: bool = False
@@ -163,6 +167,14 @@ class AnalysisConfig:
             "occupation_domain",
         ]
     )
+
+
+@dataclass
+class DatasetProfileConfig:
+    dataset: DatasetConfig
+    sample_limit: int | None = None
+    seed: int = 42
+    short_word_threshold: int = 5
 
 
 class DataCollatorSpeechSeq2SeqWithPadding:
@@ -229,14 +241,23 @@ def _normalize_analysis_config(value: AnalysisConfig | dict[str, Any]) -> Analys
     return AnalysisConfig(**payload)
 
 
+def _normalize_dataset_profile_config(value: DatasetProfileConfig | dict[str, Any]) -> DatasetProfileConfig:
+    if isinstance(value, DatasetProfileConfig):
+        return value
+
+    payload = dict(value)
+    payload["dataset"] = _normalize_dataset_config(payload["dataset"])
+    return DatasetProfileConfig(**payload)
+
+
 def _apply_recipe_defaults(config: TrainConfig) -> TrainConfig:
     recipe = config.recipe.strip().lower()
     if recipe in ("", "baseline"):
         return config
 
-    if recipe != "mixed-anchor-v1":
+    if recipe not in {"mixed-anchor-v1", "mixed-format-v1"}:
         raise ValueError(
-            f"Unsupported recipe '{config.recipe}'. Expected one of: baseline, mixed-anchor-v1"
+            f"Unsupported recipe '{config.recipe}'. Expected one of: baseline, mixed-anchor-v1, mixed-format-v1"
         )
 
     updated = config
@@ -263,6 +284,21 @@ def _apply_recipe_defaults(config: TrainConfig) -> TrainConfig:
         updated = replace(updated, learning_rate=5e-5)
     if not updated.normalize_transcripts:
         updated = replace(updated, normalize_transcripts=True)
+    if recipe == "mixed-format-v1":
+        if updated.target_module_set == "full":
+            updated = replace(updated, target_module_set="attention")
+        if updated.rank == 64:
+            updated = replace(updated, rank=16)
+        if updated.alpha == 32:
+            updated = replace(updated, alpha=32)
+        if updated.num_train_epochs == 1.0:
+            updated = replace(updated, num_train_epochs=0.5)
+        if updated.learning_rate == 5e-5:
+            updated = replace(updated, learning_rate=2e-5)
+        if updated.focus_max_samples is None:
+            updated = replace(updated, focus_max_samples=4_000)
+        if updated.focus_oversample_repeats == 0:
+            updated = replace(updated, focus_oversample_repeats=2)
     return updated
 
 
@@ -391,6 +427,74 @@ def _prepare_split(
     )
 
 
+def _contains_date_like(text: str) -> bool:
+    lowered = text.lower()
+    patterns = (
+        r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b",
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\b",
+        r"\b(jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b",
+        r"\bdate of birth\b",
+        r"\bdob\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def _contains_currency_or_amount(text: str) -> bool:
+    lowered = text.lower()
+    patterns = (
+        r"\b(rs|rupees|inr|usd|dollars?)\b",
+        r"₹",
+        r"\brefund\b",
+        r"\bamount\b",
+        r"\bbalance\b",
+        r"\baccount\b",
+        r"\bbank\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def _word_count_bucket(text: str) -> str:
+    word_count = len([token for token in text.split() if token.strip()])
+    if word_count <= 2:
+        return "1-2 words"
+    if word_count <= 5:
+        return "3-5 words"
+    if word_count <= 10:
+        return "6-10 words"
+    return "11+ words"
+
+
+def _is_format_focus_text(text: str, *, short_word_threshold: int) -> bool:
+    text = str(text or "")
+    words = [token for token in text.split() if token.strip()]
+    return (
+        any(character.isdigit() for character in text)
+        or _contains_date_like(text)
+        or _contains_currency_or_amount(text)
+        or len(words) <= short_word_threshold
+    )
+
+
+def _select_format_focus_subset(
+    dataset,
+    *,
+    text_column: str,
+    max_samples: int | None,
+    seed: int,
+    short_word_threshold: int,
+):
+    focus_indexes = [
+        index
+        for index in range(len(dataset))
+        if _is_format_focus_text(dataset[index][text_column], short_word_threshold=short_word_threshold)
+    ]
+    if not focus_indexes:
+        return dataset.select([])
+
+    focus_dataset = dataset.select(focus_indexes)
+    return _sample_dataset_rows(focus_dataset, max_samples=max_samples, seed=seed)
+
+
 def _build_compute_metrics(processor: Any):
     import evaluate
     import numpy as np
@@ -420,10 +524,17 @@ def _build_compute_metrics(processor: Any):
     return compute_metrics
 
 
-def _target_modules() -> list[str]:
-    # Following the LoRA guidance in the Thinking Machines post, we cover both
-    # attention and MLP projections rather than attention-only adapters.
-    return ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
+def _target_modules(target_module_set: str) -> list[str]:
+    normalized = target_module_set.strip().lower()
+    if normalized == "attention":
+        return ["q_proj", "k_proj", "v_proj", "out_proj"]
+    if normalized == "full":
+        # Following the LoRA guidance in the Thinking Machines post, we cover both
+        # attention and MLP projections rather than attention-only adapters.
+        return ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
+    raise ValueError(
+        f"Unsupported target_module_set '{target_module_set}'. Expected one of: full, attention"
+    )
 
 
 def _load_base_model(model_name: str, *, attn_implementation: str):
@@ -453,7 +564,7 @@ def _build_lora_model(model_name: str, config: TrainConfig):
         lora_alpha=config.alpha,
         lora_dropout=config.dropout,
         bias="none",
-        target_modules=_target_modules(),
+        target_modules=_target_modules(config.target_module_set),
     )
     model = get_peft_model(model, lora_config)
     if config.gradient_checkpointing:
@@ -693,20 +804,8 @@ def _duration_bucket(duration_seconds: float) -> str:
     return "10s+"
 
 
-def _word_count_bucket(text: str) -> str:
-    word_count = len([token for token in text.split() if token.strip()])
-    if word_count <= 2:
-        return "1-2 words"
-    if word_count <= 5:
-        return "3-5 words"
-    if word_count <= 10:
-        return "6-10 words"
-    return "11+ words"
-
-
 def _group_value(row: dict[str, Any], field_name: str) -> str:
     raw_text = str(row.get("text") or "")
-    lowered_text = raw_text.lower()
     if field_name == "duration_bucket":
         duration = float(row.get("duration") or 0.0)
         return _duration_bucket(duration)
@@ -715,22 +814,9 @@ def _group_value(row: dict[str, Any], field_name: str) -> str:
     if field_name == "contains_digit":
         return "yes" if any(character.isdigit() for character in raw_text) else "no"
     if field_name == "contains_date_like":
-        patterns = (
-            r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b",
-            r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\b",
-            r"\b(jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b",
-            r"\bdate of birth\b",
-            r"\bdob\b",
-        )
-        return "yes" if any(re.search(pattern, raw_text) for pattern in patterns) else "no"
+        return "yes" if _contains_date_like(raw_text) else "no"
     if field_name == "contains_currency_or_amount":
-        patterns = (
-            r"\b(rs|rupees|inr|usd|dollars?)\b",
-            r"₹",
-            r"\brefund\b",
-            r"\bamount\b",
-        )
-        return "yes" if any(re.search(pattern, lowered_text) for pattern in patterns) else "no"
+        return "yes" if _contains_currency_or_amount(raw_text) else "no"
     value = row.get(field_name)
     if value is None:
         return "unknown"
@@ -744,6 +830,50 @@ def _compute_text_metrics(references: list[str], predictions: list[str]) -> dict
     return {
         "wer": wer(references, predictions),
         "cer": cer(references, predictions),
+    }
+
+
+def _profile_text_dataset_impl(config: DatasetProfileConfig) -> dict[str, Any]:
+    token = _get_hf_token()
+    dataset, audio_column, text_column = _load_dataset_split(config.dataset, token=token)
+    dataset = _sample_dataset_rows(dataset, max_samples=config.sample_limit, seed=config.seed)
+
+    counts = {
+        "contains_digit": {"yes": 0, "no": 0},
+        "contains_date_like": {"yes": 0, "no": 0},
+        "contains_currency_or_amount": {"yes": 0, "no": 0},
+        "word_count_bucket": {},
+    }
+
+    for index in range(len(dataset)):
+        text = str(dataset[index][text_column])
+        counts["contains_digit"]["yes" if any(character.isdigit() for character in text) else "no"] += 1
+        counts["contains_date_like"]["yes" if _contains_date_like(text) else "no"] += 1
+        counts["contains_currency_or_amount"]["yes" if _contains_currency_or_amount(text) else "no"] += 1
+        bucket = _word_count_bucket(text)
+        counts["word_count_bucket"][bucket] = counts["word_count_bucket"].get(bucket, 0) + 1
+
+    focus_dataset = _select_format_focus_subset(
+        dataset,
+        text_column=text_column,
+        max_samples=None,
+        seed=config.seed,
+        short_word_threshold=config.short_word_threshold,
+    )
+
+    return {
+        "dataset": {
+            "name": config.dataset.name,
+            "config": config.dataset.config,
+            "split": config.dataset.split,
+            "audio_column": audio_column,
+            "text_column": text_column,
+            "sampled_rows": len(dataset),
+        },
+        "short_word_threshold": config.short_word_threshold,
+        "focus_rows": len(focus_dataset),
+        "focus_ratio": (len(focus_dataset) / len(dataset)) if len(dataset) else 0.0,
+        "counts": counts,
     }
 
 
@@ -1030,6 +1160,37 @@ def _train_and_eval_impl(config: TrainConfig) -> dict[str, Any]:
     )
     train_sources.append(primary_train_features)
 
+    if config.focus_oversample_repeats > 0:
+        primary_focus_dataset = _select_format_focus_subset(
+            train_split,
+            text_column=train_text_column,
+            max_samples=config.focus_max_samples,
+            seed=config.seed + 11,
+            short_word_threshold=config.focus_short_word_threshold,
+        )
+        if len(primary_focus_dataset):
+            primary_focus_features = _prepare_split(
+                primary_focus_dataset,
+                processor=processor,
+                audio_column=train_audio_column,
+                text_column=train_text_column,
+                normalize_transcripts=config.normalize_transcripts,
+            )
+            for _ in range(config.focus_oversample_repeats):
+                train_sources.append(primary_focus_features)
+            train_source_summaries.append(
+                {
+                    "role": "primary_format_focus",
+                    "name": config.train_dataset.name,
+                    "config": config.train_dataset.config,
+                    "split": config.train_dataset.split,
+                    "audio_column": train_audio_column,
+                    "text_column": train_text_column,
+                    "samples": len(primary_focus_dataset),
+                    "repeats": config.focus_oversample_repeats,
+                }
+            )
+
     if config.anchor_dataset is not None:
         anchor_dataset, anchor_audio_column, anchor_text_column = _load_dataset_split(
             config.anchor_dataset,
@@ -1059,6 +1220,36 @@ def _train_and_eval_impl(config: TrainConfig) -> dict[str, Any]:
                 "samples": len(anchor_dataset),
             }
         )
+        if config.focus_oversample_repeats > 0:
+            anchor_focus_dataset = _select_format_focus_subset(
+                anchor_dataset,
+                text_column=anchor_text_column,
+                max_samples=config.focus_max_samples,
+                seed=config.seed + 12,
+                short_word_threshold=config.focus_short_word_threshold,
+            )
+            if len(anchor_focus_dataset):
+                anchor_focus_features = _prepare_split(
+                    anchor_focus_dataset,
+                    processor=processor,
+                    audio_column=anchor_audio_column,
+                    text_column=anchor_text_column,
+                    normalize_transcripts=config.normalize_transcripts,
+                )
+                for _ in range(config.focus_oversample_repeats):
+                    train_sources.append(anchor_focus_features)
+                train_source_summaries.append(
+                    {
+                        "role": "anchor_format_focus",
+                        "name": config.anchor_dataset.name,
+                        "config": config.anchor_dataset.config,
+                        "split": config.anchor_dataset.split,
+                        "audio_column": anchor_audio_column,
+                        "text_column": anchor_text_column,
+                        "samples": len(anchor_focus_dataset),
+                        "repeats": config.focus_oversample_repeats,
+                    }
+                )
 
     if len(train_sources) == 1:
         train_features = train_sources[0].shuffle(seed=config.seed)
@@ -1194,7 +1385,7 @@ def _train_and_eval_impl(config: TrainConfig) -> dict[str, Any]:
             "rank": config.rank,
             "alpha": config.alpha,
             "dropout": config.dropout,
-            "target_modules": _target_modules(),
+            "target_modules": _target_modules(config.target_module_set),
             "parameter_counts": parameter_counts,
         },
         "training": {
@@ -1390,6 +1581,16 @@ def inspect_dataset_remote(dataset_payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.function(
+    timeout=60 * 30,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={str(HF_CACHE_DIR): hf_cache_volume},
+)
+def profile_dataset_text_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
+    config = _normalize_dataset_profile_config(config_payload)
+    return _profile_text_dataset_impl(config)
+
+
+@app.function(
     gpu=TRAIN_GPU,
     timeout=60 * 60 * 4,
     secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
@@ -1443,6 +1644,8 @@ def main(
     analysis_min_group_samples: int = 100,
     analysis_max_groups_per_field: int = 12,
     analysis_top_examples: int = 5,
+    profile_sample_limit: int = 0,
+    profile_short_word_threshold: int = 5,
     per_device_train_batch_size: int = 8,
     per_device_eval_batch_size: int = 4,
     gradient_accumulation_steps: int = 4,
@@ -1478,6 +1681,34 @@ def main(
 
     if mode == "inspect_eval":
         payload = inspect_dataset_remote.remote(asdict(eval_dataset_config))
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    if mode == "profile_train":
+        payload = profile_dataset_text_remote.remote(
+            asdict(
+                DatasetProfileConfig(
+                    dataset=train_dataset_config,
+                    sample_limit=profile_sample_limit or None,
+                    short_word_threshold=profile_short_word_threshold,
+                )
+            )
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    if mode == "profile_anchor":
+        if anchor_dataset_config is None:
+            raise ValueError("anchor_dataset is required for profile_anchor mode")
+        payload = profile_dataset_text_remote.remote(
+            asdict(
+                DatasetProfileConfig(
+                    dataset=anchor_dataset_config,
+                    sample_limit=profile_sample_limit or None,
+                    short_word_threshold=profile_short_word_threshold,
+                )
+            )
+        )
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
 
@@ -1556,7 +1787,7 @@ def main(
     if mode != "train_eval":
         raise ValueError(
             "Unsupported mode "
-            f"'{mode}'. Expected one of: train_eval, inspect_train, inspect_eval, benchmark_step, analyze_svarah"
+            f"'{mode}'. Expected one of: train_eval, inspect_train, inspect_eval, profile_train, profile_anchor, benchmark_step, analyze_svarah"
         )
 
     config = TrainConfig(

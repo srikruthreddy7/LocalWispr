@@ -20,6 +20,14 @@ flowchart LR
 
 ---
 
+## Core engineering rule
+
+- Prefer parallelization, batching, pipelining, and concurrency whenever work is independent and correctness is preserved.
+- Serialization should be treated as the exceptional case and should be justified by correctness, ordering, or external rate-limit constraints.
+- This rule applies to app latency work, Modal backend work, evaluation scripts, and research workflows in `tools/`.
+
+---
+
 ## Runtime Entry
 
 - `AppHost/LocalWisprHost/App.swift` starts the menu-bar app and control panel host window.

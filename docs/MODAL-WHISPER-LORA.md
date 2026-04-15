@@ -370,6 +370,34 @@ Concrete interpretation:
 - the large remaining gap is concentrated in digit normalization, form filling, banking/government phrasing, and very short commands
 - the next small experiment should explicitly protect numeric and transactional formatting instead of just mixing more generic English audio
 
+### 2026-04-15: Source dataset profiling for format coverage
+
+The next small experiment should not be launched blind. The source datasets were profiled on the same sample budgets used by `mixed-anchor-v1`.
+
+Primary dataset sample:
+
+- dataset: `WillHeld/india_accent_cv`
+- sampled rows: `40000`
+- `contains_digit=yes`: `0`
+- `contains_date_like=yes`: `542`
+- `contains_currency_or_amount=yes`: `131`
+- focus rows under the current format heuristic: `2712` (`6.78%`)
+
+Anchor dataset sample:
+
+- dataset: `openslr/librispeech_asr` (`clean`, `train.100`)
+- sampled rows: `20000`
+- `contains_digit=yes`: `0`
+- `contains_date_like=yes`: `854`
+- `contains_currency_or_amount=yes`: `297`
+- focus rows under the current format heuristic: `1253` (`6.27%`)
+
+Interpretation:
+
+- neither current source dataset supplies literal digit-form transcripts at meaningful scale
+- that means the remaining Svarah numeric gap cannot be fixed by oversampling the current data mix alone
+- the repo now contains a scaffold for a `mixed-format-v1` experiment recipe, but that recipe should be treated as incomplete until a true numeric/transactional source slice is added
+
 ## Important caveats
 
 - This workflow has been executed from this environment, but rerunning it still requires:

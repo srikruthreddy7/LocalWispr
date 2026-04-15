@@ -57,6 +57,7 @@ This is the primary performance requirement for transcription + cleanup + insert
 - Do not hardcode product behavior around a specific phrase, site, browser title pattern, app, or one-off example.
 - When a test case exposes a bug, fix the underlying class of errors at the right abstraction layer.
 - Any accuracy improvement must preserve the latency target above unless there is a deliberate, explicit tradeoff.
+- Treat **parallelization and concurrency as a default engineering rule**: when work is independent and correctness is preserved, batch it, pipeline it, or run it concurrently instead of serializing it. New work should justify serialized execution rather than accidental parallel slack.
 
 ---
 
