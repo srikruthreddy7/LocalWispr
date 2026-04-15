@@ -78,6 +78,7 @@ This is the primary performance requirement for transcription + cleanup + insert
 | `Resources/Info.plist` | Shared Info.plist (host app references this via Xcode). |
 | `AppHost/LocalWisprHost.xcodeproj` | Thin **macOS app** target that links the Swift package and hosts the SwiftUI app. |
 | `Tests/LocalWisprTests/` | Unit tests. |
+| `tools/` | Modal service code and experiment scripts. |
 
 The shipping app product is **`LocalWisprHost.app`** (bundle id `com.localwispr.host` in the Xcode project). The library is reusable for tests and tooling; the host is the runnable app.
 
@@ -115,6 +116,7 @@ Set these environment variables (or `.env`) for STT:
 
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Components, data flow, permissions, and product/technical decisions.
 - **[docs/MODAL-STT.md](docs/MODAL-STT.md)** — Modal deployment, secrets, benchmark workflow, and rollback path.
+- **[docs/MODAL-WHISPER-LORA.md](docs/MODAL-WHISPER-LORA.md)** — Modal-native Whisper LoRA experiment runbook for `india_accent_cv` → `Svarah`.
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — Future ideas (e.g. latency optimization directions), not a commitment.
 - **[docs/RELEASE.md](docs/RELEASE.md)** — Building the downloadable DMG, checksums, and GitHub Releases.
 
