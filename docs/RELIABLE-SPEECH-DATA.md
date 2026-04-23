@@ -8,6 +8,12 @@ The short version is simple:
 - the blocker is training data that does not match the target
 - the next full run should wait until the data passes a manual audit
 
+April 23 update:
+
+- the curated Common Voice 1k run did not beat base Whisper on full Svarah
+- the bucketed transfer 1k run also did not beat base Whisper on full Svarah
+- the next step should be stricter data evidence, not a larger run from the same selection logic
+
 ## Current conclusion
 
 The strongest verified recipe so far is:
@@ -1075,7 +1081,7 @@ Audio integrity check:
 - sample rate counts: `16000: 4096`
 - channel counts: `1: 4096`
 
-Next experiment:
+Executed bucketed transfer experiment:
 
 ```bash
 modal run tools/modal_whisper_lora_experiment.py \
@@ -1093,12 +1099,41 @@ modal run tools/modal_whisper_lora_experiment.py \
   --dropout 0.05 \
   --target-module-set attention \
   --per-device-train-batch-size 8 \
-  --per-device-eval-batch-size 4 \
+  --per-device-eval-batch-size 8 \
   --gradient-accumulation-steps 4 \
+  --preprocess-num-workers 16 \
+  --preprocess-batch-size 16 \
+  --distributed-gpu-count 5 \
   --skip-validation-eval
 ```
 
-Stop rule remains strict: do not scale to `2048` or `4096` unless the `1024` row bucketed run beats base WER.
+Run result:
+
+- run id: `whisper-turbo-accent-bucketed-transfer-1k-v1-20260423-204820`
+- adapter: `/artifacts/whisper-turbo-accent-bucketed-transfer-1k-v1-20260423-204820/adapter`
+- report: `/artifacts/whisper-turbo-accent-bucketed-transfer-1k-v1-20260423-204820/report.json`
+- Modal GPU: `H100!:5`
+- distributed world size: `5`
+- preprocessing: `1024` rows with `num_proc=16`
+- training runtime: `42.2915s`
+- training steps: `13`
+- train loss: `2.6227066333477316`
+- Svarah eval samples: `6656`
+
+Full Svarah metrics:
+
+| Model | WER | CER |
+| --- | ---: | ---: |
+| Base `openai/whisper-large-v3-turbo` | `0.0813502569` | `0.0387159934` |
+| Bucketed transfer LoRA | `0.0819083325` | `0.0388757214` |
+| Delta, adapter minus base | `+0.0005580756` | `+0.0001597279` |
+
+Read:
+
+- the bucketed transfer run failed the stop rule
+- restoring the old duration/context distribution was not enough to reproduce the old tiny base-beating result
+- do not scale this recipe to `2048` or `4096`
+- the next improvement needs better evidence that selected rows are genuinely useful Indian-accent supervision, not just longer Common Voice utterances
 
 ## Legacy full-run template
 

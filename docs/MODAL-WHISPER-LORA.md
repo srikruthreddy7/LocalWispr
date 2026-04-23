@@ -15,6 +15,13 @@ The training script also supports local JSONL manifests mounted from the artifac
 
 The training script now supports comma-separated config lists for dataset-backed supplements such as the confirmed Vaani district pool. This is the intended way to attach `Vaani supplement v1` as a second training source without pre-merging it offline.
 
+Current status as of April 23, 2026:
+
+- the only full-Svarah base-beating adapter remains the tiny `WillHeld/india_accent_cv` ultragentle run
+- the curated Common Voice 1k run did not beat base
+- the bucketed transfer 1k run did not beat base
+- do not scale the current curated or bucketed recipes until the data selection changes again
+
 ## Why this setup
 
 The baseline training/eval pairing is:
@@ -783,7 +790,7 @@ Audio verification:
 - sample rate counts: `16000: 4096`
 - channel counts: `1: 4096`
 
-Next training candidate:
+Executed bucketed transfer run:
 
 ```bash
 modal run tools/modal_whisper_lora_experiment.py \
@@ -801,12 +808,43 @@ modal run tools/modal_whisper_lora_experiment.py \
   --dropout 0.05 \
   --target-module-set attention \
   --per-device-train-batch-size 8 \
-  --per-device-eval-batch-size 4 \
+  --per-device-eval-batch-size 8 \
   --gradient-accumulation-steps 4 \
+  --preprocess-num-workers 16 \
+  --preprocess-batch-size 16 \
+  --distributed-gpu-count 5 \
   --skip-validation-eval
 ```
 
-Do not scale beyond `1024` rows unless this beats base WER on Svarah.
+Execution notes:
+
+- run id: `whisper-turbo-accent-bucketed-transfer-1k-v1-20260423-204820`
+- adapter: `/artifacts/whisper-turbo-accent-bucketed-transfer-1k-v1-20260423-204820/adapter`
+- report: `/artifacts/whisper-turbo-accent-bucketed-transfer-1k-v1-20260423-204820/report.json`
+- Modal GPU: `H100!:5`
+- distributed world size: `5`
+- attention backend: `sdpa`
+- preprocessing: `1024` rows with `num_proc=16`
+- training runtime: `42.2915s`
+- training steps: `13`
+- train loss: `2.6227066333477316`
+- full Svarah base and adapter eval ran concurrently on separate GPUs with progress files under `/artifacts/whisper-turbo-accent-bucketed-transfer-1k-v1-20260423-204820/progress`
+- the local Modal client lost the return payload with `Function call has expired` after the app stopped, but `report.json` was already persisted and the app ended with `0` live tasks
+
+Full Svarah result:
+
+| Model | WER | CER | Samples |
+| --- | ---: | ---: | ---: |
+| Base `openai/whisper-large-v3-turbo` | `0.0813502569` | `0.0387159934` | `6656` |
+| Bucketed transfer LoRA | `0.0819083325` | `0.0388757214` | `6656` |
+| Delta, adapter minus base | `+0.0005580756` | `+0.0001597279` | `6656` |
+
+Conclusion:
+
+- the bucketed transfer row selection did **not** beat base Whisper on Svarah
+- matching the old run's duration/context profile was not enough; the stronger speaker diversity and longer-row emphasis still moved the adapter in the wrong direction
+- do not scale this recipe to `2048` or `4096`
+- the next data search should prioritize reliable accent evidence and transcript correctness over duration bucketing alone
 
 ## Important caveats
 
