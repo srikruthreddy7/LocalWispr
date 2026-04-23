@@ -70,8 +70,12 @@ There is no chunked live transcript path in this flow; transcript output is retu
 
 `Transcriber` logs metrics to `/tmp/localwispr-debug.log` including:
 - `audioSeconds`
-- `uploadMs`
-- `serverDecodeMs` (if returned by service payload)
+- `audioEncodeMs`
+- `requestMs`
+- `serverReadMs`
+- `serverAudioPrepareMs`
+- `serverDecodeMs`
+- `serverTotalMs`
 - `textLength`
 
 ---

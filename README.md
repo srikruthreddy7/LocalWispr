@@ -118,6 +118,7 @@ Set these environment variables (or `.env`) for STT:
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Components, data flow, permissions, and product/technical decisions.
 - **[docs/MODAL-STT.md](docs/MODAL-STT.md)** — Modal deployment, secrets, benchmark workflow, and rollback path.
 - **[docs/MODAL-WHISPER-LORA.md](docs/MODAL-WHISPER-LORA.md)** — Modal-native Whisper LoRA experiment runbook for `india_accent_cv` → `Svarah`.
+- **[docs/RELIABLE-SPEECH-DATA.md](docs/RELIABLE-SPEECH-DATA.md)** — Reliable-data acquisition checklist, 500-sample audit rubric, and the gate for the next full accent training run.
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — Future ideas (e.g. latency optimization directions), not a commitment.
 - **[docs/RELEASE.md](docs/RELEASE.md)** — Building the downloadable DMG, checksums, and GitHub Releases.
 

@@ -7,6 +7,14 @@ This runbook covers the experiment path for:
 
 The implementation lives in [`tools/modal_whisper_lora_experiment.py`](../tools/modal_whisper_lora_experiment.py).
 
+The current reliable-data follow-up plan, including the April 22 shortlist for Indic-TIMIT, Common Voice Indian-accent slices, and NPTEL, lives in [`docs/RELIABLE-SPEECH-DATA.md`](./RELIABLE-SPEECH-DATA.md).
+
+Indic-TIMIT archive download and extraction inside Modal now use the lightweight helpers in [`tools/modal_volume_downloader.py`](../tools/modal_volume_downloader.py) and [`tools/modal_indic_timit_volume_tools.py`](../tools/modal_indic_timit_volume_tools.py).
+
+The training script also supports local JSONL manifests mounted from the artifacts volume, plus an explicit validation dataset. This is the current path for Indic-TIMIT train/validation manifests generated inside Modal.
+
+The training script now supports comma-separated config lists for dataset-backed supplements such as the confirmed Vaani district pool. This is the intended way to attach `Vaani supplement v1` as a second training source without pre-merging it offline.
+
 ## Why this setup
 
 The baseline training/eval pairing is:
@@ -397,6 +405,235 @@ Interpretation:
 - neither current source dataset supplies literal digit-form transcripts at meaningful scale
 - that means the remaining Svarah numeric gap cannot be fixed by oversampling the current data mix alone
 - the repo now contains a scaffold for a `mixed-format-v1` experiment recipe, but that recipe should be treated as incomplete until a true numeric/transactional source slice is added
+
+### 2026-04-22: Indic-TIMIT acquisition, training, and failure
+
+The Indic-TIMIT archives were downloaded directly into the Modal artifacts volume, extracted there, and converted into JSONL manifests so no local machine download was needed.
+
+Core artifacts:
+
+- `/artifacts/datasets/indic-timit-v2-splits/train.jsonl`
+- `/artifacts/datasets/indic-timit-v2-splits/validation.jsonl`
+- `/artifacts/datasets/indic-timit-v2-splits/test.jsonl`
+
+The script was updated to support local JSONL manifests, explicit validation datasets, multiple dataset configs, multi-GPU DDP training, detached `train_only` / `evaluate_saved_run` phases, and progress JSON under each run directory.
+
+Full Indic-TIMIT-only run:
+
+- run id: `whisper-turbo-indic-timit-4gpu-v2-20260422-193019`
+- hardware: `4x H100`
+- result on full Svarah:
+  - base WER: `0.0816364495`
+  - adapter WER: `0.1044603122`
+  - WER delta: `+0.0228238627`
+  - base CER: `0.0388499588`
+  - adapter CER: `0.0564148805`
+  - CER delta: `+0.0175649217`
+
+Failure analysis:
+
+- numeric/formatted subset WER delta: `+0.0374042927`
+- numeric/formatted subset CER delta: `+0.0307107053`
+- non-numeric subset WER delta: `+0.0034944089`
+- non-numeric subset CER delta: `-0.0002671199`
+
+Interpretation:
+
+- Indic-TIMIT is not safe as a broad primary source for this Svarah target.
+- The model did not simply fail on accent; it damaged Whisper's formatting and language priors.
+- The next experiments should reduce model movement and avoid broad Indic-TIMIT mixing.
+
+### 2026-04-22/23: CV + Indic-TIMIT and encoder-only LoRA
+
+The next test mixed Common Voice Indian-accent data with a small Indic-TIMIT anchor.
+
+Run:
+
+- run id: `whisper-turbo-accent-cv-indictimit-v1-20260422-222751`
+- primary: `WillHeld/india_accent_cv`, `16384` rows, `1-6s`
+- anchor: Indic-TIMIT train JSONL, `2048` rows, `1-6s`
+- epochs: `0.5`
+- learning rate: `2e-6`
+- LoRA: rank `16`, alpha `32`, dropout `0.05`, attention targets
+- hardware: `5x H100`
+
+Result:
+
+- adapter WER: `0.0859722679`
+- WER delta vs base: `+0.0043358184`
+- adapter CER: `0.0407357791`
+- CER delta vs base: `+0.0018858203`
+
+This was much less bad than full Indic-TIMIT-only, but still worse than base.
+
+To isolate whether decoder LoRA was damaging Whisper's language/formatting behavior, the script added `--lora-scope encoder`. Encoder-only LoRA freezes adapter parameters outside the encoder after PEFT construction.
+
+Encoder-only CV-only run:
+
+- run id: `whisper-turbo-accent-encoder-cv-only-v1-20260423-183154`
+- primary: `WillHeld/india_accent_cv`, `16384` rows, `1-6s`
+- no anchor
+- epochs: `0.5`
+- learning rate: `2e-6`
+- hardware: `5x H100`
+- eval: stable single-H100 Svarah-only path
+
+Result:
+
+- adapter WER: `0.0822231444`
+- WER delta vs base: `+0.0005866949`
+- adapter CER: `0.0392647362`
+- CER delta vs base: `+0.0004147774`
+
+Encoder-only CV + Indic-TIMIT run:
+
+- run id: `whisper-turbo-accent-encoder-cv-indictimit-v1-20260423-183156`
+- primary: `WillHeld/india_accent_cv`, `16384` rows, `1-6s`
+- anchor: Indic-TIMIT train JSONL, `2048` rows, `1-6s`
+- epochs: `0.5`
+- learning rate: `2e-6`
+- hardware: `5x H100`
+- eval: stable single-H100 Svarah-only path
+
+Result:
+
+- adapter WER: `0.0823805503`
+- WER delta vs base: `+0.0007441009`
+- adapter CER: `0.0396331410`
+- CER delta vs base: `+0.0007831822`
+
+Interpretation:
+
+- Decoder LoRA was a major part of the earlier damage.
+- Encoder-only LoRA reduces regression sharply.
+- Indic-TIMIT still hurts even with decoder drift mostly removed.
+- CV-only is better than CV + Indic-TIMIT for this benchmark.
+
+### 2026-04-23: Per-sample Svarah analysis and data selection
+
+The next analysis compared base, the old ultragentle winner, encoder-only CV-only, encoder-only CV + Indic-TIMIT, and all-attention CV + Indic-TIMIT on a 1024-sample Svarah probe.
+
+Command shape:
+
+```bash
+modal run tools/modal_whisper_lora_experiment.py \
+  --mode analyze_svarah \
+  --analysis-name svarah-data-selection-probe-v1 \
+  --compare-run-ids whisper-turbo-accent-probe-cv-ultragentle-v1-20260421-152853,whisper-turbo-accent-encoder-cv-only-v1-20260423-183154,whisper-turbo-accent-encoder-cv-indictimit-v1-20260423-183156,whisper-turbo-accent-cv-indictimit-v1-20260422-222751 \
+  --compare-labels old_cv_ultragentle,encoder_cv_only,encoder_cv_indictimit,allattn_cv_indictimit \
+  --svarah-max-samples 1024 \
+  --per-device-eval-batch-size 8 \
+  --analysis-top-examples 20
+```
+
+Artifacts:
+
+- `/artifacts/svarah-data-selection-probe-v1-20260423-191333/report.json`
+- `/artifacts/svarah-data-selection-probe-v1-20260423-191333/pairwise_predictions.jsonl`
+
+Overall probe metrics:
+
+| Model | WER | WER delta | CER | CER delta |
+| --- | ---: | ---: | ---: | ---: |
+| Base | `0.084092` | - | `0.038677` | - |
+| `old_cv_ultragentle` | `0.083997` | `-0.000095` | `0.038711` | `+0.000034` |
+| `encoder_cv_only` | `0.083997` | `-0.000095` | `0.039002` | `+0.000325` |
+| `encoder_cv_indictimit` | `0.085419` | `+0.001327` | `0.039345` | `+0.000668` |
+| `allattn_cv_indictimit` | `0.085703` | `+0.001612` | `0.039465` | `+0.000788` |
+
+Pairwise counts versus base:
+
+| Model | Improved | Worsened | Unchanged |
+| --- | ---: | ---: | ---: |
+| `old_cv_ultragentle` | `5` | `5` | `1014` |
+| `encoder_cv_only` | `37` | `32` | `955` |
+| `encoder_cv_indictimit` | `38` | `39` | `947` |
+| `allattn_cv_indictimit` | `37` | `43` | `944` |
+
+Important slices:
+
+- On `<3s` utterances, `encoder_cv_only` improved WER by `-0.010577`.
+- On `3-6s` utterances, every newer larger run regressed; `old_cv_ultragentle` stayed slightly better than base.
+- On digit-bearing utterances, `old_cv_ultragentle` preserved WER while encoder-only CV regressed slightly and encoder CV + Indic-TIMIT regressed more.
+- On `1-2` word utterances, the stronger runs improved WER, but that benefit was offset by regressions on longer utterances.
+
+Conclusion:
+
+- The project should not chase broad adaptation yet.
+- The next run should combine better row selection with the old ultragentle update size.
+- Success criterion is still beating base Whisper on Svarah, not improving train-domain validation.
+
+### 2026-04-23: Candidate data audit
+
+`ishands/commonvoice-indian_accent` became the best next source after the public data hunt.
+
+Profile result over 50000 rows:
+
+- total source rows: `110088`
+- sampled rows: `50000`
+- mean duration: `5.35s`
+- p50 duration: `5.256s`
+- p90 duration: `7.728s`
+- exact India/South Asia accent metadata: `49567/50000`
+- downvoted rows: `12130/50000`
+- rows over `8s`: `3903/50000`
+- digit-bearing transcripts: `2/50000`
+
+Selection probe:
+
+- artifact: `/artifacts/cv-indian-accent-selection-probe-v3-20260423-191752`
+- selected rows: `16384`
+- unique speakers: `1953`
+- speaker cap: `50`
+- selected duration mean: `4.86s`
+- selected duration p90: `6.79s`
+
+Training-ready curated manifest:
+
+- artifact: `/artifacts/cv-indian-accent-curated-4k-v2-20260423-192247`
+- training JSONL: `/artifacts/cv-indian-accent-curated-4k-v2-20260423-192247/train.jsonl`
+- selected rows: `4096`
+- unique speakers: `1290`
+- speaker cap: `8`
+- selected duration mean: `4.54s`
+- selected duration p90: `5.81s`
+- audio directory: `/artifacts/cv-indian-accent-curated-4k-v2-20260423-192247/audio`
+
+Rejected or deferred sources:
+
+- `skit-ai/skit-s2i`: too template-heavy and narrow-domain for broad accent adaptation.
+- `En1gma02/processed_indian_accent_english`: only `6765` rows, read-story style, weak metadata, too many long rows.
+- `edinburghcstr/edacc`: has `1004` Indian-English rows across validation/test, useful as a side eval but not primary training data.
+- Sarvam public Hugging Face datasets: useful benchmark/eval material, but no usable Indian-accent English ASR training corpus found.
+
+New tooling added:
+
+- `build_training_manifest`: metadata scoring, rejection reasons, speaker caps, progress JSON, optional audio export, training JSONL output.
+- `profile_train`: duration, word count, duplicate text, metadata top-values, quality warnings, score distribution.
+- `analyze_svarah`: per-sample prediction JSONL with base/adapters and CER/WER deltas.
+
+Next exact run:
+
+```bash
+modal run tools/modal_whisper_lora_experiment.py \
+  --mode train_eval \
+  --experiment-name whisper-turbo-accent-curated-cv-1k-v1 \
+  --train-dataset /artifacts/cv-indian-accent-curated-4k-v2-20260423-192247/train.jsonl \
+  --train-split train \
+  --train-audio-column audio \
+  --train-text-column text \
+  --train-max-samples 1024 \
+  --num-train-epochs 0.5 \
+  --learning-rate 5e-6 \
+  --rank 16 \
+  --alpha 32 \
+  --dropout 0.05 \
+  --target-module-set attention \
+  --per-device-train-batch-size 8 \
+  --per-device-eval-batch-size 4 \
+  --gradient-accumulation-steps 4 \
+  --skip-validation-eval
+```
 
 ## Important caveats
 

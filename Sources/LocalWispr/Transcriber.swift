@@ -35,6 +35,22 @@ public enum TranscriberError: LocalizedError {
 }
 
 private struct GroqVerboseTranscriptionResponse: Decodable {
+    struct Metrics: Decodable, Sendable {
+        let decodeMs: Int?
+        let requestReadMs: Int?
+        let audioPrepareMs: Int?
+        let totalMs: Int?
+        let audioSeconds: Double?
+
+        private enum CodingKeys: String, CodingKey {
+            case decodeMs = "decode_ms"
+            case requestReadMs = "request_read_ms"
+            case audioPrepareMs = "audio_prepare_ms"
+            case totalMs = "total_ms"
+            case audioSeconds = "audio_seconds"
+        }
+    }
+
     struct Segment: Decodable, Sendable {
         let id: Int?
         let start: Double
@@ -57,6 +73,35 @@ private struct GroqVerboseTranscriptionResponse: Decodable {
 
     let text: String
     let segments: [Segment]?
+    let decodeMs: Int?
+    let metrics: Metrics?
+
+    private enum CodingKeys: String, CodingKey {
+        case text
+        case segments
+        case decodeMs = "decode_ms"
+        case metrics
+    }
+
+    var serverDecodeMilliseconds: Int? {
+        metrics?.decodeMs ?? decodeMs
+    }
+
+    var serverRequestReadMilliseconds: Int? {
+        metrics?.requestReadMs
+    }
+
+    var serverAudioPrepareMilliseconds: Int? {
+        metrics?.audioPrepareMs
+    }
+
+    var serverTotalMilliseconds: Int? {
+        metrics?.totalMs ?? serverDecodeMilliseconds
+    }
+
+    var reportedAudioSeconds: Double? {
+        metrics?.audioSeconds
+    }
 }
 
 struct GroqStreamingChunkPlanner {
@@ -106,6 +151,13 @@ struct GroqStreamingChunkPlanner {
 private extension Data {
     mutating func appendUTF8(_ string: String) {
         append(contentsOf: string.utf8)
+    }
+
+    mutating func appendLittleEndian<T: FixedWidthInteger>(_ value: T) {
+        var littleEndianValue = value.littleEndian
+        Swift.withUnsafeBytes(of: &littleEndianValue) { buffer in
+            append(buffer.bindMemory(to: UInt8.self))
+        }
     }
 }
 
@@ -1343,15 +1395,10 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
             throw TranscriberError.emptyAudio
         }
 
-        let tempURL = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("localwispr-stt-\(UUID().uuidString)")
-            .appendingPathExtension("wav")
-
         do {
-            try writeFloatSamples(samples, sampleRate: 16_000, toWavFileAt: tempURL)
-            defer { try? FileManager.default.removeItem(at: tempURL) }
-
-            let audioData = try Data(contentsOf: tempURL)
+            let audioEncodingStartedAt = Date()
+            let audioData = try makeWavData(fromFloatSamples: samples, sampleRate: 16_000)
+            let audioEncodingMilliseconds = Int((Date().timeIntervalSince(audioEncodingStartedAt) * 1_000.0).rounded())
             let boundary = "Boundary-\(UUID().uuidString)"
 
             var body = Data()
@@ -1386,10 +1433,10 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
             request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
             request.httpBody = body
 
-            let uploadStartedAt = Date()
+            let requestStartedAt = Date()
             DebugLog.write("[ModalSTT] uploading \(audioData.count) bytes model=\(config.model)")
             let (data, response) = try await URLSession.shared.data(for: request)
-            let uploadMilliseconds = Int((Date().timeIntervalSince(uploadStartedAt) * 1_000.0).rounded())
+            let requestMilliseconds = Int((Date().timeIntervalSince(requestStartedAt) * 1_000.0).rounded())
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw TranscriberError.cloudRecognitionFailed("Invalid HTTP response")
             }
@@ -1405,11 +1452,14 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
                 throw TranscriberError.cloudRecognitionFailed("Empty transcript")
             }
 
-            let serverDecodeMs = Self.extractServerDecodeMilliseconds(from: data)
-            let audioSeconds = Double(samples.count) / 16_000.0
+            let serverDecodeMs = decoded.serverDecodeMilliseconds
+            let serverRequestReadMs = decoded.serverRequestReadMilliseconds
+            let serverAudioPrepareMs = decoded.serverAudioPrepareMilliseconds
+            let serverTotalMs = decoded.serverTotalMilliseconds
+            let audioSeconds = decoded.reportedAudioSeconds ?? (Double(samples.count) / 16_000.0)
             let textLength = transcript.count
             DebugLog.write(
-                "[ModalSTT] success audioSeconds=\(String(format: "%.2f", audioSeconds)) uploadMs=\(uploadMilliseconds) serverDecodeMs=\(serverDecodeMs.map(String.init) ?? "n/a") textLength=\(textLength) text=\(transcript.prefix(120))"
+                "[ModalSTT] success audioSeconds=\(String(format: "%.2f", audioSeconds)) audioEncodeMs=\(audioEncodingMilliseconds) requestMs=\(requestMilliseconds) serverReadMs=\(serverRequestReadMs.map(String.init) ?? "n/a") serverAudioPrepareMs=\(serverAudioPrepareMs.map(String.init) ?? "n/a") serverDecodeMs=\(serverDecodeMs.map(String.init) ?? "n/a") serverTotalMs=\(serverTotalMs.map(String.init) ?? "n/a") textLength=\(textLength) text=\(transcript.prefix(120))"
             )
             return decoded
         } catch let error as TranscriberError {
@@ -1417,19 +1467,6 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
         } catch {
             throw TranscriberError.cloudRecognitionFailed(error.localizedDescription)
         }
-    }
-
-    private static func extractServerDecodeMilliseconds(from data: Data) -> Int? {
-        guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        if let ms = payload["decode_ms"] as? Int {
-            return ms
-        }
-        if let metrics = payload["metrics"] as? [String: Any], let ms = metrics["decode_ms"] as? Int {
-            return ms
-        }
-        return nil
     }
 
     private func writeBuffers(_ buffers: [AVAudioPCMBuffer], toWavFileAt url: URL) throws {
@@ -1465,6 +1502,37 @@ public final class Transcriber: @unchecked Sendable, Transcribing, LiveTranscrib
         }
 
         try writeBuffers([buffer], toWavFileAt: url)
+    }
+
+    private func makeWavData(fromFloatSamples samples: [Float], sampleRate: Int) throws -> Data {
+        let bytesPerSample = MemoryLayout<Int16>.size
+        let dataSize = samples.count * bytesPerSample
+        let riffChunkSize = 36 + dataSize
+        let byteRate = sampleRate * bytesPerSample
+        let blockAlign = UInt16(bytesPerSample)
+
+        var data = Data(capacity: 44 + dataSize)
+        data.appendUTF8("RIFF")
+        data.appendLittleEndian(UInt32(riffChunkSize))
+        data.appendUTF8("WAVE")
+        data.appendUTF8("fmt ")
+        data.appendLittleEndian(UInt32(16))
+        data.appendLittleEndian(UInt16(1))
+        data.appendLittleEndian(UInt16(1))
+        data.appendLittleEndian(UInt32(sampleRate))
+        data.appendLittleEndian(UInt32(byteRate))
+        data.appendLittleEndian(blockAlign)
+        data.appendLittleEndian(UInt16(16))
+        data.appendUTF8("data")
+        data.appendLittleEndian(UInt32(dataSize))
+
+        for sample in samples {
+            let scaled = (max(-1.0, min(1.0, sample)) * Float(Int16.max)).rounded()
+            let pcmSample = Int16(max(Float(Int16.min), min(Float(Int16.max), scaled)))
+            data.appendLittleEndian(pcmSample)
+        }
+
+        return data
     }
 }
 

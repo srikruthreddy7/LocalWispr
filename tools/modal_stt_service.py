@@ -1,7 +1,7 @@
 """Modal STT service for LocalWispr (OpenAI-compatible endpoint)."""
 
+import io
 import os
-import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -35,6 +35,7 @@ class TranscriptionResult:
     text: str
     segments: list[dict[str, Any]]
     decode_ms: int
+    audio_prepare_ms: int
     audio_seconds: float | None
 
 
@@ -68,12 +69,27 @@ def _get_model():
 
 def _transcribe_audio(
     *,
-    audio_path: str,
+    audio_bytes: bytes,
     language: str | None,
     prompt: str | None,
     temperature: float,
 ) -> TranscriptionResult:
+    import librosa
+    import soundfile as sf
+
     pipe = _get_model()
+    audio_prepare_started = time.perf_counter()
+    audio, sampling_rate = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
+    if hasattr(audio, "ndim") and audio.ndim > 1:
+        audio = audio.mean(axis=1)
+
+    target_sampling_rate = int(pipe.feature_extractor.sampling_rate)
+    if int(sampling_rate) != target_sampling_rate:
+        audio = librosa.resample(audio, orig_sr=int(sampling_rate), target_sr=target_sampling_rate)
+        sampling_rate = target_sampling_rate
+
+    audio_prepare_ms = int((time.perf_counter() - audio_prepare_started) * 1000)
+
     started = time.perf_counter()
     generate_kwargs = {
         "task": "transcribe",
@@ -86,7 +102,7 @@ def _transcribe_audio(
         # We ignore client prompts here rather than fail the request.
         pass
     output = pipe(
-        audio_path,
+        {"array": audio, "sampling_rate": int(sampling_rate)},
         return_timestamps=True,
         generate_kwargs=generate_kwargs,
     )
@@ -115,11 +131,12 @@ def _transcribe_audio(
             }
         )
 
-    audio_seconds = segments[-1]["end"] if segments else None
+    audio_seconds = (len(audio) / float(sampling_rate)) if len(audio) else None
     return TranscriptionResult(
         text=text,
         segments=segments,
         decode_ms=decode_ms,
+        audio_prepare_ms=audio_prepare_ms,
         audio_seconds=audio_seconds,
     )
 
@@ -158,31 +175,33 @@ def web():
                 detail=f"Unsupported model '{model}'. Expected '{MODEL_NAME}'.",
             )
 
+        request_read_started = time.perf_counter()
         audio_bytes = await file.read()
+        request_read_ms = int((time.perf_counter() - request_read_started) * 1000)
         if not audio_bytes:
             raise HTTPException(status_code=400, detail="Audio file is empty.")
 
-        suffix = os.path.splitext(file.filename or "capture.wav")[1] or ".wav"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
-            tmp.write(audio_bytes)
-            tmp.flush()
-            result = _transcribe_audio(
-                audio_path=tmp.name,
-                language=language,
-                prompt=prompt,
-                temperature=temperature,
-            )
+        result = _transcribe_audio(
+            audio_bytes=audio_bytes,
+            language=language,
+            prompt=prompt,
+            temperature=temperature,
+        )
 
         if not result.text:
             raise HTTPException(status_code=422, detail="Transcription returned empty text.")
 
+        total_ms = request_read_ms + result.audio_prepare_ms + result.decode_ms
         payload = {
             "text": result.text,
             "segments": result.segments,
             "decode_ms": result.decode_ms,
             "model": MODEL_NAME,
             "metrics": {
+                "request_read_ms": request_read_ms,
+                "audio_prepare_ms": result.audio_prepare_ms,
                 "decode_ms": result.decode_ms,
+                "total_ms": total_ms,
                 "audio_seconds": result.audio_seconds,
             },
         }

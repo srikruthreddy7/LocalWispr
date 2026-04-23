@@ -70,15 +70,22 @@ The eval output includes:
 
 Client logs in `/tmp/localwispr-debug.log` include:
 - `audioSeconds`
-- `uploadMs`
-- `serverDecodeMs` (when service returns `decode_ms`)
+- `audioEncodeMs`
+- `requestMs`
+- `serverReadMs`
+- `serverAudioPrepareMs`
+- `serverDecodeMs`
+- `serverTotalMs`
 - `textLength`
 
 Service response includes:
 - `text`
 - `segments`
 - `decode_ms`
+- `metrics.request_read_ms`
+- `metrics.audio_prepare_ms`
 - `metrics.decode_ms`
+- `metrics.total_ms`
 - `metrics.audio_seconds`
 
 ## Rollback Procedure
