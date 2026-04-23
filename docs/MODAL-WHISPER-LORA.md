@@ -635,6 +635,98 @@ modal run tools/modal_whisper_lora_experiment.py \
   --skip-validation-eval
 ```
 
+Completed result:
+
+- run id: `whisper-turbo-accent-curated-cv-1k-v1-20260423-193101`
+- adapter: `/artifacts/whisper-turbo-accent-curated-cv-1k-v1-20260423-193101/adapter`
+- report: `/artifacts/whisper-turbo-accent-curated-cv-1k-v1-20260423-193101/report.json`
+- train rows: `1024`
+- optimizer steps: `16`
+- preprocess runtime: `4m28s`
+- train runtime: `37.9444s`
+- train loss: `2.8712950945`
+
+Full Svarah result:
+
+| Model | WER | CER |
+| --- | ---: | ---: |
+| Base | `0.0816364495` | `0.0388499588` |
+| Curated CV 1k adapter | `0.0816507591` | `0.0388267725` |
+| Delta | `+0.0000143096` | `-0.0000231863` |
+
+Decision:
+
+- do not scale this exact recipe to `2048` rows yet
+- the WER target did not beat base, even though CER improved slightly
+- next step is pairwise diagnosis, not another blind data-size increase
+
+Pairwise diagnostic:
+
+```bash
+modal run tools/modal_whisper_lora_experiment.py \
+  --mode analyze_svarah \
+  --analysis-name svarah-curated-1k-diagnostic-v1 \
+  --compare-run-ids whisper-turbo-accent-probe-cv-ultragentle-v1-20260421-152853,whisper-turbo-accent-curated-cv-1k-v1-20260423-193101 \
+  --compare-labels old_cv_ultragentle,curated_cv_1k \
+  --svarah-max-samples 1024 \
+  --per-device-eval-batch-size 8 \
+  --analysis-top-examples 20 \
+  --analysis-group-fields duration_bucket,word_count_bucket,contains_digit,contains_date_like,contains_currency_or_amount,gender,age-group,primary_language,native_place_state,occupation_domain
+```
+
+Completed diagnostic:
+
+- analysis id: `svarah-curated-1k-diagnostic-v1-20260423-195029`
+- report: `/artifacts/svarah-curated-1k-diagnostic-v1-20260423-195029/report.json`
+- pairwise predictions: `/artifacts/svarah-curated-1k-diagnostic-v1-20260423-195029/pairwise_predictions.jsonl`
+- Svarah sample count: `1024`
+
+1024-sample Svarah comparison:
+
+| Model | WER | CER | WER delta vs base |
+| --- | ---: | ---: | ---: |
+| Base | `0.0840917710` | `0.0386769668` | `0` |
+| Old CV ultragentle | `0.0839969662` | `0.0387112245` | `-0.0000948047` |
+| Curated CV 1k | `0.0841865757` | `0.0387626111` | `+0.0000948047` |
+
+Pairwise movement vs base:
+
+| Adapter | Improved | Unchanged | Worsened |
+| --- | ---: | ---: | ---: |
+| Old CV ultragentle | `5` | `1014` | `5` |
+| Curated CV 1k | `4` | `1017` | `3` |
+
+Useful diagnostic slices:
+
+| Slice | Old CV ultragentle WER delta | Curated CV 1k WER delta | Read |
+| --- | ---: | ---: | --- |
+| `<3s` | `-0.0009615` | `0` | curated data did not help short Svarah utterances |
+| `3-6s` | `-0.0002975` | `-0.0005951` | curated data helped this middle-duration band |
+| `6-10s` | `0` | `+0.0003311` | curated data started hurting longer utterances |
+| `10s+` | `+0.0003198` | `+0.0006396` | curated data hurt longest utterances more |
+| digit-bearing | `0` | `+0.0006859` | curated data still does not protect numeric/form-sensitive cases |
+| `6-10` words | `-0.0009042` | `-0.0009042` | both adapters help this band |
+| `11+` words | `+0.0001302` | `+0.0003905` | curated data hurts longer textual contexts |
+
+Observed curated regressions:
+
+- inserted `that` in `Then throughout the story...`
+- dropped a leading `And` in one sample
+- changed `Perfume` to `Parfume`
+
+Observed curated improvements:
+
+- corrected one `we are`/`we or` confusion
+- improved a TataCliq spacing/form issue
+- improved several phonetically-close noisy hypotheses, though not always to the exact reference
+
+Conclusion:
+
+- the curated 1k recipe is safer than the larger CV+Indic runs, but it still does not beat base WER
+- the selection was too conservative: it over-focused short, clean Common Voice rows and under-covered longer Svarah-style utterances, named entities, product-like words, and formatting-sensitive text
+- do not run a `2048`/`4096` scale-up of this exact manifest
+- the next useful step is to compare the old winning 1024-row source distribution against the curated manifest, then change the selection objective before training again
+
 ## Important caveats
 
 - This workflow has been executed from this environment, but rerunning it still requires:

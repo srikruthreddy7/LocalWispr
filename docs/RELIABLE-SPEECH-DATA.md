@@ -912,6 +912,109 @@ Then repeat only if the `1024` row run beats base:
 
 Stop as soon as the curve turns negative. The goal is accent transfer with minimum model movement.
 
+### Curated 1024-row result
+
+The first curated Common Voice Indian-accent run completed after this plan was written.
+
+Run:
+
+- run id: `whisper-turbo-accent-curated-cv-1k-v1-20260423-193101`
+- training JSONL: `/artifacts/cv-indian-accent-curated-4k-v2-20260423-192247/train.jsonl`
+- train rows: `1024`
+- epochs: `0.5`
+- learning rate: `5e-6`
+- LoRA: rank `16`, alpha `32`, dropout `0.05`, attention targets, all scope
+- GPU: `H100!`
+
+Training:
+
+- preprocess runtime: `4m28s`
+- optimizer steps: `16`
+- train runtime: `37.9444s`
+- train loss: `2.8712950945`
+
+Full Svarah result:
+
+| Model | WER | CER |
+| --- | ---: | ---: |
+| Base | `0.0816364495` | `0.0388499588` |
+| Curated CV 1k adapter | `0.0816507591` | `0.0388267725` |
+| Delta | `+0.0000143096` | `-0.0000231863` |
+
+Decision:
+
+- do **not** scale this exact recipe to `2048` rows yet
+- WER did not beat base, even though CER improved slightly
+- treat this as a near-tie, not a win
+- pairwise diagnostics are required before changing the data recipe
+
+### Curated 1024-row pairwise diagnostic
+
+The diagnostic compared base Whisper, the old best `WillHeld/india_accent_cv` ultragentle adapter, and the new curated Common Voice 1k adapter on the same 1024 Svarah examples.
+
+Run:
+
+- analysis id: `svarah-curated-1k-diagnostic-v1-20260423-195029`
+- report: `/artifacts/svarah-curated-1k-diagnostic-v1-20260423-195029/report.json`
+- pairwise predictions: `/artifacts/svarah-curated-1k-diagnostic-v1-20260423-195029/pairwise_predictions.jsonl`
+- compared adapters:
+  - `old_cv_ultragentle`: `whisper-turbo-accent-probe-cv-ultragentle-v1-20260421-152853`
+  - `curated_cv_1k`: `whisper-turbo-accent-curated-cv-1k-v1-20260423-193101`
+
+Overall on the 1024-sample Svarah probe:
+
+| Model | WER | CER | WER delta vs base |
+| --- | ---: | ---: | ---: |
+| Base | `0.0840917710` | `0.0386769668` | `0` |
+| Old CV ultragentle | `0.0839969662` | `0.0387112245` | `-0.0000948047` |
+| Curated CV 1k | `0.0841865757` | `0.0387626111` | `+0.0000948047` |
+
+Per-sample movement vs base:
+
+| Adapter | Improved | Unchanged | Worsened |
+| --- | ---: | ---: | ---: |
+| Old CV ultragentle | `5` | `1014` | `5` |
+| Curated CV 1k | `4` | `1017` | `3` |
+
+Important slices:
+
+| Slice | Old CV ultragentle WER delta | Curated CV 1k WER delta | Interpretation |
+| --- | ---: | ---: | --- |
+| `<3s` duration | `-0.0009615` | `0` | curated selection did not help the shortest Svarah examples |
+| `3-6s` duration | `-0.0002975` | `-0.0005951` | curated selection helped this band more than the old adapter |
+| `6-10s` duration | `0` | `+0.0003311` | curated selection started to hurt longer utterances |
+| `10s+` duration | `+0.0003198` | `+0.0006396` | curated selection hurt the longest utterances more |
+| digit-bearing examples | `0` | `+0.0006859` | curated selection still does not cover numeric/form-sensitive behavior |
+| `6-10` word examples | `-0.0009042` | `-0.0009042` | both adapters helped the medium word-count band |
+| `11+` word examples | `+0.0001302` | `+0.0003905` | curated selection hurt longer textual contexts |
+
+Concrete curated regressions:
+
+- inserted an extra `that` into one `Then throughout the story...` sample
+- dropped a leading `And` from one reference
+- changed `Perfume` to `Parfume`
+
+Concrete curated improvements:
+
+- improved a `we are`/`we or` confusion
+- improved a TataCliq spacing/form issue
+- improved several phonetically-close hypotheses, even where the final reference still was not perfect
+
+Interpretation:
+
+- The curated 1k run was not a disaster, but it also did not beat base WER.
+- It moved fewer samples than the old and encoder-only probes, which is why the full result is nearly tied.
+- The data selection over-corrected toward short, clean, high-agreement Common Voice rows.
+- Svarah needs some messier but reliable examples: longer utterances, named entities, product-like words, and Indian-English lexical patterns.
+- Numeric/form-sensitive examples remain fragile and should be protected during evaluation, not blindly optimized with weak synthetic text.
+
+Decision after the diagnostic:
+
+- do **not** scale this exact curated 1k recipe
+- reproduce/profile the old winning 1024-row `WillHeld/india_accent_cv` distribution
+- compare old-vs-curated training rows by duration, transcript shape, entity-like text, duplicate text, and speaker diversity
+- build a revised manifest that keeps the current quality filters but deliberately restores longer and entity-heavy rows before the next training run
+
 ## First full run after the audit passes
 
 When the curated data is ready, start with the proven conservative recipe:
