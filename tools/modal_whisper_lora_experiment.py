@@ -245,6 +245,7 @@ class TrainingManifestConfig:
     output_limit: int = 16_384
     seed: int = 42
     quality_preset: str = "accent_safe"
+    selection_strategy: str = "score"
     max_samples_per_speaker: int = 50
     export_audio: bool = True
     normalize_transcripts: bool = True
@@ -266,6 +267,21 @@ class DatasetConfigSurveyConfig:
     max_workers: int = 6
     sample_transcripts_per_config: int = 3
     top_k: int = 25
+
+
+@dataclass
+class AudioManifestVerifyConfig:
+    verify_name: str = "audio-manifest-verify"
+    dataset: DatasetConfig = field(
+        default_factory=lambda: DatasetConfig(
+            name="/artifacts/training-manifest/train.jsonl",
+            split="train",
+            audio_column="audio",
+            text_column="text",
+        )
+    )
+    sample_limit: int | None = None
+    seed: int = 42
 
 
 @dataclass
@@ -491,6 +507,7 @@ def _normalize_training_manifest_config(
     payload = dict(value)
     payload["dataset"] = _normalize_dataset_config(payload["dataset"])
     payload["metadata_fields"] = list(payload.get("metadata_fields", []))
+    payload.setdefault("selection_strategy", "score")
     return TrainingManifestConfig(**payload)
 
 
@@ -504,6 +521,17 @@ def _normalize_dataset_survey_config(
     payload["dataset"] = _normalize_dataset_config(payload["dataset"])
     payload["config_names"] = list(payload.get("config_names", []))
     return DatasetConfigSurveyConfig(**payload)
+
+
+def _normalize_audio_manifest_verify_config(
+    value: AudioManifestVerifyConfig | dict[str, Any],
+) -> AudioManifestVerifyConfig:
+    if isinstance(value, AudioManifestVerifyConfig):
+        return value
+
+    payload = dict(value)
+    payload["dataset"] = _normalize_dataset_config(payload["dataset"])
+    return AudioManifestVerifyConfig(**payload)
 
 
 def _apply_recipe_defaults(config: TrainConfig) -> TrainConfig:
@@ -1527,6 +1555,136 @@ def _build_audit_manifest_impl(config: AuditConfig) -> dict[str, Any]:
     return report
 
 
+def _manifest_candidate_transfer_score(candidate: dict[str, Any]) -> float:
+    score_payload = candidate["score_payload"]
+    score = float(score_payload["score"])
+    duration_seconds = score_payload["duration_seconds"]
+    word_count = int(score_payload["word_count"])
+
+    if duration_seconds is not None:
+        duration = float(duration_seconds)
+        if 6.0 <= duration <= 10.0:
+            score += 24.0
+        elif 3.0 <= duration < 6.0:
+            score += 10.0
+        elif duration < 3.0:
+            score -= 10.0
+        elif duration > 10.0:
+            score -= 20.0
+
+    if word_count >= 11:
+        score += 18.0
+    elif 6 <= word_count <= 10:
+        score += 8.0
+    elif word_count <= 5:
+        score -= 8.0
+
+    if (
+        score_payload["contains_digit"] == "yes"
+        or score_payload["contains_date_like"] == "yes"
+        or score_payload["contains_currency_or_amount"] == "yes"
+    ):
+        score -= 2.0
+
+    return score
+
+
+def _manifest_candidate_bucket(candidate: dict[str, Any]) -> str:
+    score_payload = candidate["score_payload"]
+    duration_seconds = score_payload["duration_seconds"]
+    word_count = int(score_payload["word_count"])
+    is_format_sensitive = (
+        score_payload["contains_digit"] == "yes"
+        or score_payload["contains_date_like"] == "yes"
+        or score_payload["contains_currency_or_amount"] == "yes"
+    )
+    if is_format_sensitive:
+        return "format_sensitive"
+    if (duration_seconds is not None and float(duration_seconds) >= 6.0) or word_count >= 11:
+        return "long_context"
+    if (duration_seconds is not None and float(duration_seconds) >= 3.0) and word_count >= 6:
+        return "medium_context"
+    return "short_context"
+
+
+def _select_manifest_candidates_by_score(
+    candidates: list[dict[str, Any]],
+    *,
+    output_limit: int,
+    max_samples_per_speaker: int,
+    rejection_counts: dict[str, int],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    selected = []
+    speaker_counts: dict[str, int] = {}
+    for candidate in candidates:
+        speaker_key = str(candidate["speaker_key"])
+        if max_samples_per_speaker > 0 and speaker_counts.get(speaker_key, 0) >= max_samples_per_speaker:
+            rejection_counts["speaker_cap"] = rejection_counts.get("speaker_cap", 0) + 1
+            continue
+        selected.append(candidate)
+        speaker_counts[speaker_key] = speaker_counts.get(speaker_key, 0) + 1
+        if len(selected) >= output_limit:
+            break
+    return selected, speaker_counts
+
+
+def _select_manifest_candidates_bucketed_transfer(
+    candidates: list[dict[str, Any]],
+    *,
+    output_limit: int,
+    max_samples_per_speaker: int,
+    rejection_counts: dict[str, int],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    ordered_candidates = sorted(
+        candidates,
+        key=lambda item: (
+            -_manifest_candidate_transfer_score(item),
+            item["tie_breaker"],
+        ),
+    )
+    quotas = {
+        "long_context": int(round(output_limit * 0.55)),
+        "medium_context": int(round(output_limit * 0.35)),
+        "short_context": int(round(output_limit * 0.08)),
+        "format_sensitive": max(1, output_limit - int(round(output_limit * 0.55)) - int(round(output_limit * 0.35)) - int(round(output_limit * 0.08))),
+    }
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[int] = set()
+    speaker_counts: dict[str, int] = {}
+
+    def try_add(candidate: dict[str, Any]) -> bool:
+        candidate_id = int(candidate["dataset_index"])
+        if candidate_id in selected_ids:
+            return False
+        speaker_key = str(candidate["speaker_key"])
+        if max_samples_per_speaker > 0 and speaker_counts.get(speaker_key, 0) >= max_samples_per_speaker:
+            rejection_counts["speaker_cap"] = rejection_counts.get("speaker_cap", 0) + 1
+            return False
+        selected.append(candidate)
+        selected_ids.add(candidate_id)
+        speaker_counts[speaker_key] = speaker_counts.get(speaker_key, 0) + 1
+        return True
+
+    for bucket_name, quota in quotas.items():
+        if quota <= 0:
+            continue
+        added_for_bucket = 0
+        for candidate in ordered_candidates:
+            if len(selected) >= output_limit or added_for_bucket >= quota:
+                break
+            if _manifest_candidate_bucket(candidate) != bucket_name:
+                continue
+            if try_add(candidate):
+                added_for_bucket += 1
+
+    for candidate in ordered_candidates:
+        if len(selected) >= output_limit:
+            break
+        try_add(candidate)
+
+    return selected, speaker_counts
+
+
 def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, Any]:
     import soundfile as sf
     from transformers.models.whisper.english_normalizer import BasicTextNormalizer
@@ -1559,6 +1717,7 @@ def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, A
             "exported_rows": 0,
             "output_limit": config.output_limit,
             "export_audio": config.export_audio,
+            "selection_strategy": config.selection_strategy,
         },
         commit=True,
     )
@@ -1604,6 +1763,7 @@ def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, A
                     "exported_rows": 0,
                     "output_limit": config.output_limit,
                     "export_audio": config.export_audio,
+                    "selection_strategy": config.selection_strategy,
                 },
                 commit=True,
             )
@@ -1620,17 +1780,23 @@ def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, A
 
     candidates.sort(key=lambda item: (-float(item["score_payload"]["score"]), item["tie_breaker"]))
 
-    selected = []
-    speaker_counts: dict[str, int] = {}
-    for candidate in candidates:
-        speaker_key = str(candidate["speaker_key"])
-        if config.max_samples_per_speaker > 0 and speaker_counts.get(speaker_key, 0) >= config.max_samples_per_speaker:
-            rejection_counts["speaker_cap"] = rejection_counts.get("speaker_cap", 0) + 1
-            continue
-        selected.append(candidate)
-        speaker_counts[speaker_key] = speaker_counts.get(speaker_key, 0) + 1
-        if len(selected) >= config.output_limit:
-            break
+    selection_strategy = config.selection_strategy.strip().lower()
+    if selection_strategy == "score":
+        selected, speaker_counts = _select_manifest_candidates_by_score(
+            candidates,
+            output_limit=config.output_limit,
+            max_samples_per_speaker=config.max_samples_per_speaker,
+            rejection_counts=rejection_counts,
+        )
+    elif selection_strategy == "bucketed_transfer":
+        selected, speaker_counts = _select_manifest_candidates_bucketed_transfer(
+            candidates,
+            output_limit=config.output_limit,
+            max_samples_per_speaker=config.max_samples_per_speaker,
+            rejection_counts=rejection_counts,
+        )
+    else:
+        raise ValueError("Unsupported manifest selection_strategy. Expected one of: score, bucketed_transfer")
     _write_run_progress(
         manifest_dir,
         {
@@ -1644,6 +1810,7 @@ def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, A
             "exported_rows": 0,
             "output_limit": config.output_limit,
             "export_audio": config.export_audio,
+            "selection_strategy": selection_strategy,
         },
         commit=True,
     )
@@ -1774,6 +1941,7 @@ def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, A
             "selected_rows": len(manifest_rows),
             "candidate_rows": len(candidates),
             "quality_preset": config.quality_preset,
+            "selection_strategy": selection_strategy,
             "max_samples_per_speaker": config.max_samples_per_speaker,
             "unique_speakers": len(speaker_counts),
             "score_distribution_all_loaded": _summarize_numeric_values(score_values),
@@ -1806,6 +1974,7 @@ def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, A
             "exported_rows": len(manifest_rows),
             "output_limit": config.output_limit,
             "export_audio": config.export_audio,
+            "selection_strategy": selection_strategy,
             "report_path": str(manifest_dir / "report.json"),
         },
         commit=True,
@@ -2971,7 +3140,7 @@ def _text_quality_flags(text: str) -> dict[str, Any]:
 
 
 def _speaker_key(row: dict[str, Any]) -> str:
-    for field_name in ("client_id", "speaker_id", "speaker", "speaker_id_hash", "user_id"):
+    for field_name in ("speaker_key", "client_id", "speaker_id", "speaker", "speaker_id_hash", "user_id"):
         value = row.get(field_name)
         if value is not None and str(value).strip():
             return str(value).strip()
@@ -3215,6 +3384,515 @@ def _profile_text_dataset_impl(config: DatasetProfileConfig) -> dict[str, Any]:
             )[:20]
         ],
     }
+
+
+def _contains_indian_lexical_marker(text: str) -> bool:
+    lowered = str(text or "").lower()
+    markers = (
+        "india",
+        "indian",
+        "delhi",
+        "mumbai",
+        "bombay",
+        "bangalore",
+        "bengaluru",
+        "hyderabad",
+        "chennai",
+        "madras",
+        "kolkata",
+        "calcutta",
+        "pune",
+        "ahmedabad",
+        "lucknow",
+        "jaipur",
+        "kochi",
+        "cochin",
+        "mysore",
+        "mysuru",
+        "surat",
+        "kanpur",
+        "nagpur",
+        "patna",
+        "bhopal",
+        "visakhapatnam",
+        "vijayawada",
+        "coimbatore",
+        "thiruvananthapuram",
+        "trivandrum",
+        "kerala",
+        "karnataka",
+        "telangana",
+        "andhra",
+        "tamil nadu",
+        "maharashtra",
+        "punjab",
+        "gujarat",
+        "rajasthan",
+        "uttar pradesh",
+        "madhya pradesh",
+        "arunachal pradesh",
+        "assam",
+        "bihar",
+        "odisha",
+        "orissa",
+        "haryana",
+        "hindi",
+        "tamil",
+        "telugu",
+        "kannada",
+        "malayalam",
+        "marathi",
+        "punjabi",
+        "gujarati",
+        "bengali",
+        "odia",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _text_shape_flags(raw_text: str, training_text: str) -> dict[str, Any]:
+    raw = str(raw_text or "")
+    tokens = re.findall(r"[A-Za-z][A-Za-z'.-]*", raw)
+    capitalized_noninitial = sum(
+        1
+        for index, token in enumerate(tokens)
+        if index > 0 and len(token) > 1 and token[0].isupper() and token[1:].islower()
+    )
+    all_caps_tokens = sum(1 for token in tokens if len(token) > 1 and token.isupper())
+    mixed_case_tokens = sum(
+        1
+        for token in tokens
+        if len(token) > 2 and any(character.islower() for character in token) and any(character.isupper() for character in token)
+    )
+    return {
+        "contains_digit": "yes" if any(character.isdigit() for character in training_text) else "no",
+        "contains_date_like": "yes" if _contains_date_like(training_text) else "no",
+        "contains_currency_or_amount": "yes" if _contains_currency_or_amount(training_text) else "no",
+        "contains_indian_lexical_marker": "yes" if _contains_indian_lexical_marker(training_text) else "no",
+        "contains_apostrophe": "yes" if "'" in raw or "'" in training_text else "no",
+        "contains_hyphen": "yes" if "-" in raw or "-" in training_text else "no",
+        "raw_has_case_signal": "yes" if any(character.isupper() for character in raw) else "no",
+        "capitalized_noninitial_tokens": capitalized_noninitial,
+        "all_caps_tokens": all_caps_tokens,
+        "mixed_case_tokens": mixed_case_tokens,
+        "entity_like": "yes" if capitalized_noninitial > 0 or all_caps_tokens > 0 or mixed_case_tokens > 0 else "no",
+    }
+
+
+def _profile_selected_dataset_rows(
+    dataset,
+    *,
+    audio_column: str,
+    text_column: str,
+    normalize_transcripts: bool,
+    short_word_threshold: int,
+    quality_preset: str = "lenient",
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    transcript_normalizer = None
+    if normalize_transcripts:
+        from transformers.models.whisper.english_normalizer import BasicTextNormalizer
+
+        transcript_normalizer = BasicTextNormalizer()
+
+    metadata_fields = [
+        field_name
+        for field_name in (
+            "accents",
+            "accent",
+            "age",
+            "gender",
+            "locale",
+            "language",
+            "state",
+            "district",
+            "primary_language",
+            "native_place_state",
+            "occupation_domain",
+            "source_dataset",
+            "source_config",
+            "speaker_key",
+            "client_id",
+            "up_votes",
+            "down_votes",
+            "quality_score",
+            "dataset_index",
+        )
+        if field_name in dataset.column_names
+    ]
+    metadata_dataset = dataset.remove_columns([audio_column])
+
+    counts = {
+        "contains_digit": {"yes": 0, "no": 0},
+        "contains_date_like": {"yes": 0, "no": 0},
+        "contains_currency_or_amount": {"yes": 0, "no": 0},
+        "contains_indian_lexical_marker": {"yes": 0, "no": 0},
+        "contains_apostrophe": {"yes": 0, "no": 0},
+        "contains_hyphen": {"yes": 0, "no": 0},
+        "raw_has_case_signal": {"yes": 0, "no": 0},
+        "entity_like": {"yes": 0, "no": 0},
+        "word_count_bucket": {},
+        "duration_bucket": {},
+    }
+    duration_values: list[float] = []
+    word_counts: list[float] = []
+    quality_scores: list[float] = []
+    capitalized_noninitial_values: list[float] = []
+    all_caps_values: list[float] = []
+    mixed_case_values: list[float] = []
+    warning_counts: dict[str, int] = {}
+    reject_counts: dict[str, int] = {}
+    duplicate_counts: dict[str, int] = {}
+    metadata_samples: dict[str, list[str]] = {}
+    speaker_keys: list[str] = []
+    row_payloads: list[dict[str, Any]] = []
+
+    for index in range(len(dataset)):
+        metadata_row = metadata_dataset[index]
+        source_text = str(metadata_row[text_column] or "")
+        raw_text = str(metadata_row.get("raw_transcript") or source_text)
+        training_text = (
+            _clean_transcript_text(source_text, normalizer=transcript_normalizer)
+            if transcript_normalizer is not None
+            else _strip_transcript_markup(source_text)
+        )
+        full_row = None
+        duration_seconds = _row_duration_seconds(metadata_row, audio_column=audio_column)
+        if duration_seconds is None:
+            full_row = dataset[index]
+            duration_seconds = _row_duration_seconds(full_row, audio_column=audio_column)
+        if duration_seconds is not None:
+            duration_values.append(duration_seconds)
+            duration_bucket = _duration_bucket(duration_seconds)
+        else:
+            duration_bucket = "unknown"
+        counts["duration_bucket"][duration_bucket] = counts["duration_bucket"].get(duration_bucket, 0) + 1
+
+        word_count = _word_count(training_text)
+        word_counts.append(float(word_count))
+        word_bucket = _word_count_bucket(training_text)
+        counts["word_count_bucket"][word_bucket] = counts["word_count_bucket"].get(word_bucket, 0) + 1
+
+        flags = _text_shape_flags(raw_text, training_text)
+        for key in (
+            "contains_digit",
+            "contains_date_like",
+            "contains_currency_or_amount",
+            "contains_indian_lexical_marker",
+            "contains_apostrophe",
+            "contains_hyphen",
+            "raw_has_case_signal",
+            "entity_like",
+        ):
+            counts[key][flags[key]] += 1
+        capitalized_noninitial_values.append(float(flags["capitalized_noninitial_tokens"]))
+        all_caps_values.append(float(flags["all_caps_tokens"]))
+        mixed_case_values.append(float(flags["mixed_case_tokens"]))
+
+        normalized_training_text = re.sub(r"\s+", " ", training_text.strip().lower())
+        duplicate_counts[normalized_training_text] = duplicate_counts.get(normalized_training_text, 0) + 1
+        score_payload = _score_training_row(
+            full_row if full_row is not None else metadata_row,
+            text_column=text_column,
+            audio_column=audio_column,
+            quality_preset=quality_preset,
+        )
+        quality_scores.append(float(score_payload["score"]))
+        for warning in score_payload["warnings"]:
+            warning_counts[warning] = warning_counts.get(warning, 0) + 1
+        for reason in score_payload["reject_reasons"]:
+            reject_counts[reason] = reject_counts.get(reason, 0) + 1
+
+        speaker_key = _speaker_key(metadata_row)
+        speaker_keys.append(speaker_key)
+        for field_name in metadata_fields:
+            metadata_samples.setdefault(field_name, []).append(str(metadata_row.get(field_name) or "unknown"))
+
+        row_payload = {
+            "selection_index": index + 1,
+            "raw_text": raw_text,
+            "source_text": source_text,
+            "training_text": training_text,
+            "duration_seconds": duration_seconds,
+            "duration_bucket": duration_bucket,
+            "word_count": word_count,
+            "word_count_bucket": word_bucket,
+            "speaker_key": speaker_key,
+            "quality_score": score_payload["score"],
+            "quality_warnings": score_payload["warnings"],
+            "quality_reject_reasons": score_payload["reject_reasons"],
+        }
+        row_payload.update(flags)
+        for field_name in metadata_fields:
+            row_payload[field_name] = metadata_row.get(field_name)
+        row_payloads.append(row_payload)
+
+    focus_rows = sum(
+        1
+        for row in row_payloads
+        if _is_format_focus_text(row["training_text"], short_word_threshold=short_word_threshold)
+    )
+    duplicate_texts = [
+        {"text": text, "count": count}
+        for text, count in sorted(
+            ((text, count) for text, count in duplicate_counts.items() if text and count > 1),
+            key=lambda item: (-item[1], item[0]),
+        )[:20]
+    ]
+    speaker_count_values = _top_counts(speaker_keys, limit=20)
+
+    profile = {
+        "rows": len(dataset),
+        "short_word_threshold": short_word_threshold,
+        "focus_rows": focus_rows,
+        "focus_ratio": (focus_rows / len(dataset)) if len(dataset) else 0.0,
+        "counts": counts,
+        "duration_seconds": _summarize_numeric_values(duration_values),
+        "word_count": _summarize_numeric_values(word_counts),
+        "quality_score": _summarize_numeric_values(quality_scores),
+        "text_shape": {
+            "capitalized_noninitial_tokens": _summarize_numeric_values(capitalized_noninitial_values),
+            "all_caps_tokens": _summarize_numeric_values(all_caps_values),
+            "mixed_case_tokens": _summarize_numeric_values(mixed_case_values),
+        },
+        "quality_warnings": dict(sorted(warning_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "quality_reject_reasons": dict(sorted(reject_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "metadata_top_values": {
+            field_name: _top_counts(values, limit=12)
+            for field_name, values in metadata_samples.items()
+        },
+        "speaker_summary": {
+            "unique_speakers": len(set(speaker_keys)),
+            "top_speakers": speaker_count_values,
+        },
+        "top_duplicate_texts": duplicate_texts,
+    }
+    return profile, row_payloads
+
+
+def _write_profile_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            handle.write("\n")
+
+
+def _profile_train_selection_impl(config: TrainConfig) -> dict[str, Any]:
+    token = _get_hf_token()
+    profile_run_id = f"{config.experiment_name}-train-selection-profile-{_now_utc()}"
+    profile_dir = ARTIFACTS_DIR / profile_run_id
+    _ensure_dir(profile_dir)
+
+    split_payload = _resolve_train_validation_splits(config, token=token)
+    train_profile, train_rows = _profile_selected_dataset_rows(
+        split_payload["train_split"],
+        audio_column=split_payload["train_audio_column"],
+        text_column=split_payload["train_text_column"],
+        normalize_transcripts=config.normalize_transcripts,
+        short_word_threshold=config.focus_short_word_threshold,
+    )
+    validation_profile, validation_rows = _profile_selected_dataset_rows(
+        split_payload["validation_split"],
+        audio_column=split_payload["validation_audio_column"],
+        text_column=split_payload["validation_text_column"],
+        normalize_transcripts=config.normalize_transcripts,
+        short_word_threshold=config.focus_short_word_threshold,
+    )
+
+    train_rows_path = profile_dir / "train_rows.jsonl"
+    validation_rows_path = profile_dir / "validation_rows.jsonl"
+    _write_profile_rows(train_rows_path, train_rows)
+    _write_profile_rows(validation_rows_path, validation_rows)
+
+    report = {
+        "profile_run_id": profile_run_id,
+        "created_at_utc": _now_iso(),
+        "train_config": asdict(config),
+        "dataset": {
+            "name": config.train_dataset.name,
+            "config": config.train_dataset.config,
+            "config_names": config.train_dataset.config_names,
+            "split": config.train_dataset.split,
+            "audio_column": split_payload["train_audio_column"],
+            "text_column": split_payload["train_text_column"],
+        },
+        "selection": {
+            "seed": config.seed,
+            "train_validation_split": config.train_validation_split,
+            "train_max_samples": config.train_max_samples,
+            "validation_max_samples": config.validation_max_samples,
+            "validation_source": split_payload["validation_source_summary"],
+            "normalize_transcripts": config.normalize_transcripts,
+        },
+        "train_profile": train_profile,
+        "validation_profile": validation_profile,
+        "artifacts": {
+            "profile_dir": str(profile_dir),
+            "report": str(profile_dir / "report.json"),
+            "train_rows": str(train_rows_path),
+            "validation_rows": str(validation_rows_path),
+        },
+    }
+    _write_json(profile_dir / "report.json", report)
+    artifacts_volume.commit()
+    hf_cache_volume.commit()
+    return report
+
+
+def _verify_audio_manifest_impl(config: AudioManifestVerifyConfig) -> dict[str, Any]:
+    import soundfile as sf
+
+    manifest_path = Path(config.dataset.name)
+    if not manifest_path.exists() or manifest_path.suffix.lower() != ".jsonl":
+        raise ValueError("verify_audio_manifest currently expects a local JSONL manifest path")
+
+    audio_column = config.dataset.audio_column or "audio"
+    text_column = config.dataset.text_column or "text"
+    verify_run_id = f"{config.verify_name}-{_now_utc()}"
+    verify_dir = ARTIFACTS_DIR / verify_run_id
+    _ensure_dir(verify_dir)
+
+    rng = random.Random(config.seed)
+    rows: list[dict[str, Any]] = []
+    rows_seen = 0
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            row = json.loads(stripped)
+            rows_seen += 1
+            if config.sample_limit is None or config.sample_limit <= 0:
+                rows.append(row)
+            elif len(rows) < config.sample_limit:
+                rows.append(row)
+            else:
+                replacement_index = rng.randint(0, rows_seen - 1)
+                if replacement_index < config.sample_limit:
+                    rows[replacement_index] = row
+
+    print(
+        f"[verify-audio:{verify_run_id}] loaded manifest_rows={rows_seen} "
+        f"rows_to_check={len(rows)}"
+    )
+    _write_run_progress(
+        verify_dir,
+        {
+            "stage": "verify_audio_manifest",
+            "status": "loaded_manifest",
+            "updated_at_utc": _now_iso(),
+            "manifest_rows": rows_seen,
+            "total_rows": len(rows),
+            "checked_rows": 0,
+            "failures": 0,
+        },
+        commit=True,
+    )
+
+    failures = []
+    duration_values: list[float] = []
+    sample_rate_counts: dict[str, int] = {}
+    channels_counts: dict[str, int] = {}
+    bytes_values: list[float] = []
+    started_at = datetime.now(tz=UTC)
+
+    for index, row in enumerate(rows, start=1):
+        raw_audio_path = str(row.get(audio_column) or "").strip()
+        if not raw_audio_path:
+            failures.append(
+                {
+                    "row": index,
+                    "reason": "missing_audio_path",
+                    "text": str(row.get(text_column) or "")[:200],
+                }
+            )
+            continue
+        audio_path = Path(raw_audio_path)
+        if not audio_path.is_absolute():
+            audio_path = ARTIFACTS_DIR / raw_audio_path.lstrip("/")
+        try:
+            info = sf.info(str(audio_path))
+            duration = float(info.frames) / float(info.samplerate) if info.samplerate else 0.0
+            duration_values.append(duration)
+            sample_rate_key = str(info.samplerate)
+            sample_rate_counts[sample_rate_key] = sample_rate_counts.get(sample_rate_key, 0) + 1
+            channels_key = str(info.channels)
+            channels_counts[channels_key] = channels_counts.get(channels_key, 0) + 1
+            if audio_path.exists():
+                bytes_values.append(float(audio_path.stat().st_size))
+        except Exception as exc:
+            failures.append(
+                {
+                    "row": index,
+                    "audio": str(audio_path),
+                    "reason": type(exc).__name__,
+                    "message": str(exc)[:500],
+                    "text": str(row.get(text_column) or "")[:200],
+                }
+            )
+
+        if index == 1 or index % 100 == 0 or index == len(rows):
+            elapsed = max(0.001, (datetime.now(tz=UTC) - started_at).total_seconds())
+            print(
+                f"[verify-audio:{verify_run_id}] checked {index}/{len(rows)} "
+                f"failures={len(failures)} rows_per_second={index / elapsed:.2f}"
+            )
+            _write_run_progress(
+                verify_dir,
+                {
+                    "stage": "verify_audio_manifest",
+                    "status": "checking",
+                    "updated_at_utc": _now_iso(),
+                    "checked_rows": index,
+                    "total_rows": len(rows),
+                    "failures": len(failures),
+                    "rows_per_second": index / elapsed,
+                },
+                commit=True,
+            )
+
+    report = {
+        "verify_run_id": verify_run_id,
+        "created_at_utc": _now_iso(),
+        "dataset": {
+            "name": config.dataset.name,
+            "audio_column": audio_column,
+            "text_column": text_column,
+            "rows_seen": rows_seen,
+            "rows_checked": len(rows),
+            "sample_limit": config.sample_limit,
+            "seed": config.seed,
+        },
+        "audio": {
+            "valid_rows": len(rows) - len(failures),
+            "failed_rows": len(failures),
+            "duration_seconds": _summarize_numeric_values(duration_values),
+            "file_bytes": _summarize_numeric_values(bytes_values),
+            "sample_rate_counts": sample_rate_counts,
+            "channels_counts": channels_counts,
+            "failures": failures[:50],
+        },
+        "artifacts": {
+            "verify_dir": str(verify_dir),
+            "report": str(verify_dir / "report.json"),
+            "progress": str(verify_dir / "progress.json"),
+        },
+    }
+    _write_json(verify_dir / "report.json", report)
+    _write_run_progress(
+        verify_dir,
+        {
+            "stage": "verify_audio_manifest",
+            "status": "complete",
+            "updated_at_utc": _now_iso(),
+            "checked_rows": len(rows),
+            "total_rows": len(rows),
+            "failures": len(failures),
+            "report_path": str(verify_dir / "report.json"),
+        },
+        commit=True,
+    )
+    artifacts_volume.commit()
+    return report
 
 
 def _summarize_group_metrics(
@@ -4790,6 +5468,28 @@ def profile_dataset_text_remote(config_payload: dict[str, Any]) -> dict[str, Any
 
 
 @app.function(
+    timeout=60 * 60 * 2,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={
+        str(ARTIFACTS_DIR): artifacts_volume,
+        str(HF_CACHE_DIR): hf_cache_volume,
+    },
+)
+def profile_train_selection_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
+    config = _normalize_train_config(config_payload)
+    return _profile_train_selection_impl(config)
+
+
+@app.function(
+    timeout=60 * 60,
+    volumes={str(ARTIFACTS_DIR): artifacts_volume},
+)
+def verify_audio_manifest_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
+    config = _normalize_audio_manifest_verify_config(config_payload)
+    return _verify_audio_manifest_impl(config)
+
+
+@app.function(
     timeout=60 * 60 * 6,
     secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
     volumes={
@@ -4918,10 +5618,12 @@ def main(
     manifest_sample_limit: int = 50_000,
     manifest_output_limit: int = 16_384,
     manifest_quality_preset: str = "accent_safe",
+    manifest_selection_strategy: str = "score",
     manifest_max_samples_per_speaker: int = 50,
     manifest_export_audio: bool = True,
     manifest_normalize_transcripts: bool = True,
     manifest_metadata_fields: str = "",
+    audio_verify_name: str = "audio-manifest-verify",
     survey_name: str = "dataset-config-survey",
     survey_config_regex: str = "",
     survey_config_names: str = "",
@@ -5137,12 +5839,24 @@ def main(
             output_limit=manifest_output_limit,
             seed=audit_seed,
             quality_preset=manifest_quality_preset,
+            selection_strategy=manifest_selection_strategy,
             max_samples_per_speaker=manifest_max_samples_per_speaker,
             export_audio=manifest_export_audio,
             normalize_transcripts=manifest_normalize_transcripts,
             metadata_fields=[field.strip() for field in manifest_metadata_fields.split(",") if field.strip()],
         )
         payload = build_training_manifest_remote.remote(asdict(manifest_config))
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    if mode == "verify_audio_manifest":
+        verify_config = AudioManifestVerifyConfig(
+            verify_name=audio_verify_name,
+            dataset=train_dataset_config,
+            sample_limit=profile_sample_limit or None,
+            seed=audit_seed,
+        )
+        payload = verify_audio_manifest_remote.remote(asdict(verify_config))
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
 
@@ -5296,10 +6010,15 @@ def main(
         print(json.dumps(report, indent=2, sort_keys=True))
         return
 
+    if mode == "profile_train_selection":
+        report = profile_train_selection_remote.remote(asdict(config))
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+
     if mode != "train_eval":
         raise ValueError(
             "Unsupported mode "
-            f"'{mode}'. Expected one of: train_eval, train_only, evaluate_saved_run, inspect_train, inspect_eval, profile_train, profile_anchor, survey_train_configs, download_external_archives, build_audit_manifest, build_training_manifest, benchmark_step, analyze_svarah"
+            f"'{mode}'. Expected one of: train_eval, train_only, evaluate_saved_run, profile_train_selection, inspect_train, inspect_eval, profile_train, profile_anchor, survey_train_configs, download_external_archives, build_audit_manifest, build_training_manifest, verify_audio_manifest, benchmark_step, analyze_svarah"
         )
 
     if distributed_gpu_count == 4:

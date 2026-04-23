@@ -727,6 +727,87 @@ Conclusion:
 - do not run a `2048`/`4096` scale-up of this exact manifest
 - the next useful step is to compare the old winning 1024-row source distribution against the curated manifest, then change the selection objective before training again
 
+### April 23, 2026 selection-profile analysis
+
+New tooling added:
+
+- `profile_train_selection`: profiles the exact training rows selected by the same train/validation split and sampling path used by `train_eval`
+- `build_training_manifest --manifest-selection-strategy bucketed_transfer`: keeps the existing quality/rejection filters but prioritizes longer contextual utterances before sorting by score
+- `verify_audio_manifest`: checks every local JSONL audio path with `soundfile.info`, writes progress, and reports sample rate/channel/duration integrity
+
+Exact selected-row profiles:
+
+| Selection | Mean duration | p50 duration | p90 duration | `6-10s` rows | `11+` word rows | Unique speakers | Format-sensitive rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Old CV ultragentle 1k | `5.642s` | `5.508s` | `7.812s` | `390` | `541` | `271` | `18` |
+| Curated CV 1k | `4.535s` | `4.620s` | `5.753s` | `40` | `264` | `661` | `0` |
+| Bucketed transfer probe 1k | `5.768s` | `6.120s` | `7.416s` | `579` | `598` | `657` | `18` |
+
+Interpretation:
+
+- the failed curated 1k run was too short and too clean relative to the only base-beating recipe
+- the old winning recipe was not special because of Indian lexical text; both old and curated selected only `4` explicit Indian lexical-marker rows
+- the likely useful signal was longer Indian-accent speech over richer English sentences, not domain text
+- the new bucketed transfer recipe deliberately restores that length/context shape while keeping stronger speaker diversity than the old sample
+
+Metadata-only bucketed probe:
+
+- run id: `cv-indian-accent-bucketed-transfer-4k-probe-v1-20260423-200908`
+- manifest: `/artifacts/cv-indian-accent-bucketed-transfer-4k-probe-v1-20260423-200908/manifest.jsonl`
+- output rows: `4096`
+- selection strategy: `bucketed_transfer`
+- selected duration mean: `5.748s`
+- selected duration p50: `6.144s`
+- selected duration p90: `7.488s`
+- unique speakers: `1313`
+
+Audio-backed bucketed manifest:
+
+- run id: `cv-indian-accent-bucketed-transfer-4k-v1-20260423-201156`
+- training JSONL: `/artifacts/cv-indian-accent-bucketed-transfer-4k-v1-20260423-201156/train.jsonl`
+- manifest JSONL: `/artifacts/cv-indian-accent-bucketed-transfer-4k-v1-20260423-201156/manifest.jsonl`
+- audio dir: `/artifacts/cv-indian-accent-bucketed-transfer-4k-v1-20260423-201156/audio`
+- output rows: `4096`
+- selected duration mean: `5.748s`
+- selected duration p50: `6.144s`
+- selected duration p90: `7.488s`
+- unique speakers: `1313`
+
+Audio verification:
+
+- verify id: `cv-indian-accent-bucketed-transfer-4k-v1-audio-verify-v2-20260423-201910`
+- report: `/artifacts/cv-indian-accent-bucketed-transfer-4k-v1-audio-verify-v2-20260423-201910/report.json`
+- checked rows: `4096`
+- valid rows: `4096`
+- failed rows: `0`
+- sample rate counts: `16000: 4096`
+- channel counts: `1: 4096`
+
+Next training candidate:
+
+```bash
+modal run tools/modal_whisper_lora_experiment.py \
+  --mode train_eval \
+  --experiment-name whisper-turbo-accent-bucketed-transfer-1k-v1 \
+  --train-dataset /artifacts/cv-indian-accent-bucketed-transfer-4k-v1-20260423-201156/train.jsonl \
+  --train-split train \
+  --train-audio-column audio \
+  --train-text-column text \
+  --train-max-samples 1024 \
+  --num-train-epochs 0.5 \
+  --learning-rate 5e-6 \
+  --rank 16 \
+  --alpha 32 \
+  --dropout 0.05 \
+  --target-module-set attention \
+  --per-device-train-batch-size 8 \
+  --per-device-eval-batch-size 4 \
+  --gradient-accumulation-steps 4 \
+  --skip-validation-eval
+```
+
+Do not scale beyond `1024` rows unless this beats base WER on Svarah.
+
 ## Important caveats
 
 - This workflow has been executed from this environment, but rerunning it still requires:
