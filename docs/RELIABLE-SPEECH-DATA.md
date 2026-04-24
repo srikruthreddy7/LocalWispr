@@ -158,6 +158,23 @@ Audio verification passed:
 - failed rows: `0`
 - all files are mono `16 kHz`
 
+Training result:
+
+- run id: `whisper-turbo-hardmine-cv-largev3-693-encoder-v1-20260424-163502`
+- train rows: `623`
+- validation rows: `70`
+- recipe: encoder-only attention LoRA, rank `16`, alpha `32`, LR `5e-6`, `3` epochs
+- base Svarah WER/CER: `0.0813502569` / `0.0387159934`
+- adapter Svarah WER/CER: `0.0816364495` / `0.0387907049`
+- delta: `+0.0002861926` WER, `+0.0000747115` CER
+
+Read:
+
+- the filtered hard-mined Common Voice data still does not beat base
+- the problem is not just noisy labels or too much decoder adaptation
+- Common Voice Indian-accent hard examples do not transfer strongly enough to Svarah by themselves
+- next data work should shift away from Common Voice-only training and toward either a true Svarah-like source or a runtime router using large-v3
+
 ## Target data profile
 
 For this project, a reliable training set must be:

@@ -1055,6 +1055,59 @@ Audio verification:
 - sample rate: all `16000`
 - channels: all mono
 
+### April 24, 2026 hard-mined encoder-only LoRA
+
+Executed training run:
+
+```bash
+modal run tools/modal_whisper_lora_experiment.py \
+  --mode train_eval \
+  --experiment-name whisper-turbo-hardmine-cv-largev3-693-encoder-v1 \
+  --train-dataset /artifacts/hard-mine-cv-indian-largev3-v1-filtered-score003-dedup/train.jsonl \
+  --train-split train \
+  --train-audio-column audio \
+  --train-text-column text \
+  --num-train-epochs 3 \
+  --learning-rate 5e-6 \
+  --rank 16 \
+  --alpha 32 \
+  --dropout 0.05 \
+  --target-module-set attention \
+  --lora-scope encoder \
+  --normalize-transcripts \
+  --per-device-train-batch-size 8 \
+  --per-device-eval-batch-size 8 \
+  --gradient-accumulation-steps 4 \
+  --distributed-gpu-count 5
+```
+
+Run details:
+
+- run id: `whisper-turbo-hardmine-cv-largev3-693-encoder-v1-20260424-163502`
+- train rows: `623`
+- validation rows: `70`
+- LoRA scope: encoder only
+- target modules: attention projections
+- trainable parameters: `5242880`
+- training steps: `48`
+- training runtime: `40.5555s`
+- train loss: `2.7012397`
+
+Full Svarah result:
+
+| Model | WER | CER |
+| --- | ---: | ---: |
+| Base `openai/whisper-large-v3-turbo` | `0.0813502569` | `0.0387159934` |
+| Hard-mined encoder-only LoRA | `0.0816364495` | `0.0387907049` |
+| Delta, adapter minus base | `+0.0002861926` | `+0.0000747115` |
+
+Read:
+
+- the hard-mined Common Voice rows are cleaner than the prior bucketed transfer set, but they still do not improve Svarah
+- encoder-only LoRA reduced blast radius but did not create a win
+- this makes "more Common Voice hard examples" a weak next bet
+- the strongest remaining measured option is still plain `openai/whisper-large-v3` or a router that can pick large-v3 when turbo is likely wrong
+
 ## Important caveats
 
 - This workflow has been executed from this environment, but rerunning it still requires:
