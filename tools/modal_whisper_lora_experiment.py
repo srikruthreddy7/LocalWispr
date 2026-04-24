@@ -198,6 +198,80 @@ class AnalysisConfig:
 
 
 @dataclass
+class SvarahInferenceSweepConfig:
+    sweep_name: str = "svarah-inference-sweep"
+    eval_dataset: DatasetConfig = field(
+        default_factory=lambda: DatasetConfig(
+            name="ai4bharat/Svarah",
+            split="test",
+        )
+    )
+    base_models: list[str] = field(default_factory=lambda: [BASE_MODEL])
+    adapter_runs: list[dict[str, str]] = field(default_factory=list)
+    adapter_scales: list[float] = field(default_factory=lambda: [1.0])
+    attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION
+    language: str = "english"
+    task: str = "transcribe"
+    max_new_tokens: int = 256
+    per_device_eval_batch_size: int = 4
+    distributed_gpu_count: int = 5
+    min_group_samples: int = 100
+    max_groups_per_field: int = 12
+    top_examples: int = 5
+    group_fields: list[str] = field(
+        default_factory=lambda: [
+            "duration_bucket",
+            "word_count_bucket",
+            "contains_digit",
+            "contains_date_like",
+            "contains_currency_or_amount",
+            "gender",
+            "age-group",
+            "primary_language",
+            "native_place_state",
+            "occupation_domain",
+        ]
+    )
+
+
+@dataclass
+class HardExampleMiningConfig:
+    mine_name: str = "hard-example-manifest"
+    dataset: DatasetConfig = field(
+        default_factory=lambda: DatasetConfig(
+            name="ishands/commonvoice-indian_accent",
+            split="train",
+        )
+    )
+    base_model: str = BASE_MODEL
+    teacher_model: str = "openai/whisper-large-v3"
+    attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION
+    language: str = "english"
+    task: str = "transcribe"
+    max_new_tokens: int = 256
+    per_device_eval_batch_size: int = 8
+    distributed_gpu_count: int = 5
+    sample_limit: int = 10_000
+    output_limit: int = 1024
+    seed: int = 42
+    min_word_count: int = 4
+    max_word_count: int = 16
+    min_duration_seconds: float = 1.5
+    max_duration_seconds: float = 8.0
+    turbo_min_cer: float = 0.04
+    turbo_max_cer: float = 0.35
+    turbo_min_wer_word_count: int = 3
+    teacher_max_cer: float = 0.02
+    min_selection_score: float = 0.03
+    reject_format_sensitive: bool = True
+    dedupe_text: bool = True
+    max_samples_per_speaker: int = 8
+    export_audio: bool = True
+    normalize_transcripts: bool = True
+    metadata_fields: list[str] = field(default_factory=list)
+
+
+@dataclass
 class DatasetProfileConfig:
     dataset: DatasetConfig
     sample_limit: int | None = None
@@ -433,6 +507,16 @@ def _parse_config_names(raw_value: str) -> list[str]:
     return [value.strip() for value in raw_value.split(",") if value.strip()]
 
 
+def _parse_float_list(raw_value: str) -> list[float]:
+    values = []
+    for chunk in raw_value.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        values.append(float(item))
+    return values
+
+
 def _normalize_train_config(value: TrainConfig | dict[str, Any]) -> TrainConfig:
     if isinstance(value, TrainConfig):
         config = _apply_recipe_defaults(value)
@@ -465,6 +549,33 @@ def _normalize_analysis_config(value: AnalysisConfig | dict[str, Any]) -> Analys
     payload["group_fields"] = list(payload.get("group_fields", []))
     payload["row_filters"] = dict(payload.get("row_filters", {}))
     return AnalysisConfig(**payload)
+
+
+def _normalize_svarah_inference_sweep_config(
+    value: SvarahInferenceSweepConfig | dict[str, Any],
+) -> SvarahInferenceSweepConfig:
+    if isinstance(value, SvarahInferenceSweepConfig):
+        return value
+
+    payload = dict(value)
+    payload["eval_dataset"] = _normalize_dataset_config(payload["eval_dataset"])
+    payload["base_models"] = [str(item) for item in payload.get("base_models", [])]
+    payload["adapter_runs"] = [dict(item) for item in payload.get("adapter_runs", [])]
+    payload["adapter_scales"] = [float(item) for item in payload.get("adapter_scales", [])]
+    payload["group_fields"] = list(payload.get("group_fields", []))
+    return SvarahInferenceSweepConfig(**payload)
+
+
+def _normalize_hard_example_mining_config(
+    value: HardExampleMiningConfig | dict[str, Any],
+) -> HardExampleMiningConfig:
+    if isinstance(value, HardExampleMiningConfig):
+        return value
+
+    payload = dict(value)
+    payload["dataset"] = _normalize_dataset_config(payload["dataset"])
+    payload["metadata_fields"] = list(payload.get("metadata_fields", []))
+    return HardExampleMiningConfig(**payload)
 
 
 def _normalize_dataset_profile_config(value: DatasetProfileConfig | dict[str, Any]) -> DatasetProfileConfig:
@@ -4242,6 +4353,1097 @@ def _worker_script_path() -> Path:
     return Path(__file__)
 
 
+def _model_label(model_name: str) -> str:
+    return _sanitize_artifact_component(model_name.split("/")[-1])
+
+
+def _format_scale_label(value: float) -> str:
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+def _apply_peft_adapter_scale(model: Any, adapter_scale: float) -> None:
+    for module in model.modules():
+        scaling = getattr(module, "scaling", None)
+        if not isinstance(scaling, dict):
+            continue
+        for adapter_name, current_scale in list(scaling.items()):
+            base_scales = getattr(module, "_localwispr_base_scaling", None)
+            if base_scales is None:
+                base_scales = {}
+                setattr(module, "_localwispr_base_scaling", base_scales)
+            if adapter_name not in base_scales:
+                base_scales[adapter_name] = float(current_scale)
+            scaling[adapter_name] = base_scales[adapter_name] * adapter_scale
+
+
+def _build_svarah_sweep_candidates(config: SvarahInferenceSweepConfig) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for index, model_name in enumerate(config.base_models):
+        label = "base" if index == 0 else f"base-{_model_label(model_name)}"
+        candidates.append(
+            {
+                "label": label,
+                "phase_key": _sanitize_artifact_component(label),
+                "model_role": "base",
+                "base_model": model_name,
+                "adapter_dir": None,
+                "adapter_run_id": None,
+                "adapter_scale": None,
+            }
+        )
+
+    for adapter_run in config.adapter_runs:
+        run_id = str(adapter_run["run_id"])
+        adapter_label = str(adapter_run["label"])
+        adapter_dir = str(adapter_run["adapter_dir"])
+        adapter_base_model = str(adapter_run.get("base_model") or config.base_models[0])
+        for adapter_scale in config.adapter_scales:
+            scale_label = _format_scale_label(adapter_scale)
+            label = f"{adapter_label}@{scale_label}"
+            candidates.append(
+                {
+                    "label": label,
+                    "phase_key": _sanitize_artifact_component(label),
+                    "model_role": "adapter",
+                    "base_model": adapter_base_model,
+                    "adapter_dir": adapter_dir,
+                    "adapter_run_id": run_id,
+                    "adapter_scale": adapter_scale,
+                }
+            )
+
+    phase_keys_seen: set[str] = set()
+    for candidate in candidates:
+        phase_key = candidate["phase_key"]
+        if phase_key in phase_keys_seen:
+            raise ValueError(f"Duplicate sweep candidate phase key: {phase_key}")
+        phase_keys_seen.add(phase_key)
+    return candidates
+
+
+def _svarah_sweep_worker_main(config_path: str) -> None:
+    import torch
+    from peft import PeftModel
+
+    payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    config = _normalize_svarah_inference_sweep_config(payload["sweep_config"])
+    candidate = dict(payload["candidate"])
+    phase_key = str(payload["phase_key"])
+    phase_name = str(payload["phase_name"])
+
+    hf_token = _get_hf_token()
+    processor = _build_processor(str(candidate["base_model"]), language=config.language, task=config.task)
+    dataset, audio_column, text_column = _load_dataset_split(config.eval_dataset, token=hf_token)
+    model = _load_base_model(
+        str(candidate["base_model"]),
+        attn_implementation=config.attn_implementation,
+    )
+    if candidate["model_role"] == "adapter":
+        model = PeftModel.from_pretrained(model, str(candidate["adapter_dir"]))
+        _apply_peft_adapter_scale(model, float(candidate["adapter_scale"]))
+
+    prediction_payload = _predict_dataset(
+        model=model,
+        processor=processor,
+        dataset=dataset,
+        audio_column=audio_column,
+        text_column=text_column,
+        language=config.language,
+        task=config.task,
+        max_new_tokens=config.max_new_tokens,
+        batch_size=config.per_device_eval_batch_size,
+        phase_name=phase_name,
+        progress_path=Path(payload["progress_path"]),
+        progress_log_interval_batches=25,
+    )
+    result_payload = {
+        "phase_key": phase_key,
+        "phase_name": phase_name,
+        "candidate": candidate,
+        "sample_count": len(prediction_payload["references"]),
+        "predictions": prediction_payload["predictions"],
+        "references": prediction_payload["references"],
+        "normalized_predictions": prediction_payload["normalized_predictions"],
+        "normalized_references": prediction_payload["normalized_references"],
+        "metadata_rows": prediction_payload["metadata_rows"],
+    }
+    _write_phase_progress(Path(payload["output_path"]), result_payload, commit=True)
+    del model
+    torch.cuda.empty_cache()
+
+
+def _aggregate_sweep_progress(run_dir: Path, worker_payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    phases: dict[str, Any] = {}
+    samples_done = 0
+    samples_total = 0
+    for payload in worker_payloads:
+        samples_total += int(payload["sample_count"])
+        progress_path = Path(payload["progress_path"])
+        phase_state = {
+            "phase_name": payload["phase_name"],
+            "candidate": payload["candidate"],
+            "samples_total": int(payload["sample_count"]),
+            "samples_done": 0,
+            "batches_done": 0,
+            "batches_total": None,
+            "gpu_index": payload.get("gpu_index"),
+            "status": "pending",
+        }
+        if progress_path.exists():
+            phase_state.update(json.loads(progress_path.read_text(encoding="utf-8")))
+            status = str(phase_state.get("status") or "running")
+            phase_state["status"] = "running" if status == "pending" else status
+        if Path(payload["output_path"]).exists():
+            phase_state["status"] = "complete"
+            phase_state["samples_done"] = int(payload["sample_count"])
+        phases[payload["phase_key"]] = phase_state
+        samples_done += int(phase_state.get("samples_done", 0))
+
+    return {
+        "stage": "svarah_inference_sweep",
+        "updated_at_utc": _now_iso(),
+        "eval": {
+            "samples_done": samples_done,
+            "samples_total": samples_total,
+            "percent_complete": (samples_done / samples_total) if samples_total else 0.0,
+            "phases": phases,
+        },
+    }
+
+
+def _run_worker_processes_bounded(
+    *,
+    run_dir: Path,
+    worker_payloads: list[dict[str, Any]],
+    gpu_count: int,
+    worker_arg_name: str,
+    progress_builder: Any,
+    failure_label: str,
+) -> None:
+    pending = list(worker_payloads)
+    running: list[tuple[dict[str, Any], subprocess.Popen[str]]] = []
+    gpu_indexes = list(range(max(1, gpu_count)))
+    last_commit = time.monotonic()
+
+    try:
+        while pending or running:
+            used_gpu_indexes = {int(payload["gpu_index"]) for payload, _ in running}
+            available_gpu_indexes = [index for index in gpu_indexes if index not in used_gpu_indexes]
+            while pending and available_gpu_indexes:
+                payload = pending.pop(0)
+                payload["gpu_index"] = available_gpu_indexes.pop(0)
+                worker_config_path = _run_progress_dir(run_dir) / f"{payload['phase_key']}.worker.json"
+                _write_phase_progress(worker_config_path, payload)
+                env = dict(os.environ)
+                env["CUDA_VISIBLE_DEVICES"] = str(payload["gpu_index"])
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(_worker_script_path()),
+                        worker_arg_name,
+                        str(worker_config_path),
+                    ],
+                    cwd=str(_worker_script_path().parent),
+                    env=env,
+                )
+                running.append((payload, process))
+
+            next_running: list[tuple[dict[str, Any], subprocess.Popen[str]]] = []
+            for payload, process in running:
+                return_code = process.poll()
+                if return_code is None:
+                    next_running.append((payload, process))
+                    continue
+                if return_code != 0:
+                    raise RuntimeError(
+                        f"{failure_label} worker {payload['phase_key']} failed with exit code {return_code}"
+                    )
+
+            running = next_running
+            progress_payload = progress_builder(run_dir, worker_payloads)
+            should_commit = (time.monotonic() - last_commit) >= 15 or not (pending or running)
+            _write_run_progress(run_dir, progress_payload, commit=should_commit)
+            if should_commit:
+                last_commit = time.monotonic()
+            if pending or running:
+                time.sleep(5)
+    finally:
+        for _, process in running:
+            if process.poll() is None:
+                process.terminate()
+
+
+def _run_sweep_workers_bounded(
+    *,
+    run_dir: Path,
+    worker_payloads: list[dict[str, Any]],
+    gpu_count: int,
+) -> None:
+    _run_worker_processes_bounded(
+        run_dir=run_dir,
+        worker_payloads=worker_payloads,
+        gpu_count=gpu_count,
+        worker_arg_name="--svarah-sweep-worker-config-path",
+        progress_builder=_aggregate_sweep_progress,
+        failure_label="Svarah sweep",
+    )
+
+
+def _compute_oracle_summary(
+    *,
+    raw_references: list[str],
+    normalized_references: list[str],
+    raw_predictions_by_model: dict[str, list[str]],
+    normalized_predictions_by_model: dict[str, list[str]],
+    baseline_label: str,
+) -> dict[str, Any]:
+    from jiwer import cer, wer
+
+    oracle_predictions = []
+    oracle_raw_predictions = []
+    choice_counts: dict[str, int] = {}
+    labels = list(normalized_predictions_by_model)
+
+    for index, reference in enumerate(normalized_references):
+        best_label = baseline_label
+        best_score = (
+            wer(reference, normalized_predictions_by_model[baseline_label][index]),
+            cer(reference, normalized_predictions_by_model[baseline_label][index]),
+            0,
+        )
+        for label in labels:
+            candidate_score = (
+                wer(reference, normalized_predictions_by_model[label][index]),
+                cer(reference, normalized_predictions_by_model[label][index]),
+                0 if label == baseline_label else 1,
+            )
+            if candidate_score < best_score:
+                best_label = label
+                best_score = candidate_score
+        choice_counts[best_label] = choice_counts.get(best_label, 0) + 1
+        oracle_predictions.append(normalized_predictions_by_model[best_label][index])
+        oracle_raw_predictions.append(raw_predictions_by_model[best_label][index])
+
+    metrics = _compute_text_metrics(normalized_references, oracle_predictions)
+    baseline_metrics = _compute_text_metrics(
+        normalized_references,
+        normalized_predictions_by_model[baseline_label],
+    )
+    return {
+        "metrics": metrics,
+        "delta_vs_baseline": {
+            "wer": metrics["wer"] - baseline_metrics["wer"],
+            "cer": metrics["cer"] - baseline_metrics["cer"],
+        },
+        "choice_counts": choice_counts,
+        "preview": [
+            {
+                "reference": raw_references[index],
+                "prediction": oracle_raw_predictions[index],
+            }
+            for index in range(min(5, len(raw_references)))
+        ],
+    }
+
+
+def _run_svarah_inference_sweep_impl(config: SvarahInferenceSweepConfig) -> dict[str, Any]:
+    hf_token = _get_hf_token()
+    dataset, audio_column, text_column = _load_dataset_split(config.eval_dataset, token=hf_token)
+    sweep_run_id = f"{config.sweep_name}-{_now_utc()}"
+    run_dir = ARTIFACTS_DIR / sweep_run_id
+    progress_dir = _run_progress_dir(run_dir)
+    _ensure_dir(progress_dir)
+
+    candidates = _build_svarah_sweep_candidates(config)
+    if not candidates:
+        raise ValueError("svarah_inference_sweep requires at least one candidate")
+
+    worker_payloads: list[dict[str, Any]] = []
+    for candidate in candidates:
+        phase_key = str(candidate["phase_key"])
+        worker_payloads.append(
+            {
+                "phase_key": phase_key,
+                "phase_name": f"svarah sweep {candidate['label']}",
+                "candidate": candidate,
+                "sample_count": len(dataset),
+                "gpu_index": None,
+                "progress_path": str(_phase_progress_path(run_dir, phase_key)),
+                "output_path": str(progress_dir / f"{phase_key}.result.json"),
+                "sweep_config": asdict(config),
+            }
+        )
+
+    _write_run_progress(
+        run_dir,
+        {
+            "stage": "svarah_inference_sweep",
+            "updated_at_utc": _now_iso(),
+            "status": "starting",
+            "samples_total": len(dataset) * len(worker_payloads),
+            "candidates_total": len(worker_payloads),
+            "phases": {
+                payload["phase_key"]: {
+                    "phase_name": payload["phase_name"],
+                    "candidate": payload["candidate"],
+                    "samples_total": int(payload["sample_count"]),
+                }
+                for payload in worker_payloads
+            },
+        },
+        commit=True,
+    )
+
+    _run_sweep_workers_bounded(
+        run_dir=run_dir,
+        worker_payloads=worker_payloads,
+        gpu_count=max(1, min(config.distributed_gpu_count, len(worker_payloads))),
+    )
+
+    prediction_payloads = {
+        payload["candidate"]["label"]: json.loads(Path(payload["output_path"]).read_text(encoding="utf-8"))
+        for payload in worker_payloads
+    }
+    baseline_label = candidates[0]["label"]
+    metadata_rows = prediction_payloads[baseline_label]["metadata_rows"]
+    raw_references = prediction_payloads[baseline_label]["references"]
+    normalized_references = prediction_payloads[baseline_label]["normalized_references"]
+    raw_predictions_by_model = {
+        label: payload["predictions"] for label, payload in prediction_payloads.items()
+    }
+    normalized_predictions_by_model = {
+        label: payload["normalized_predictions"] for label, payload in prediction_payloads.items()
+    }
+
+    overall_metrics = {
+        label: _compute_text_metrics(normalized_references, predictions)
+        for label, predictions in normalized_predictions_by_model.items()
+    }
+    deltas_vs_baseline = {
+        label: {
+            "wer": metrics["wer"] - overall_metrics[baseline_label]["wer"],
+            "cer": metrics["cer"] - overall_metrics[baseline_label]["cer"],
+        }
+        for label, metrics in overall_metrics.items()
+        if label != baseline_label
+    }
+
+    comparison_predictions = {
+        "base": normalized_predictions_by_model[baseline_label],
+        **{
+            label: predictions
+            for label, predictions in normalized_predictions_by_model.items()
+            if label != baseline_label
+        },
+    }
+    comparison_raw_predictions = {
+        "base": raw_predictions_by_model[baseline_label],
+        **{
+            label: predictions
+            for label, predictions in raw_predictions_by_model.items()
+            if label != baseline_label
+        },
+    }
+    pairwise_predictions_path = run_dir / "pairwise_predictions.jsonl"
+    _write_pairwise_prediction_rows(
+        output_path=pairwise_predictions_path,
+        metadata_rows=metadata_rows,
+        raw_references=raw_references,
+        raw_predictions_by_model=comparison_raw_predictions,
+        normalized_references=normalized_references,
+        normalized_predictions_by_model=comparison_predictions,
+    )
+
+    report = {
+        "created_at_utc": datetime.now(tz=UTC).isoformat(),
+        "sweep_run_id": sweep_run_id,
+        "runtime": {
+            "modal_gpu": os.environ.get("MODAL_GPU_LABEL", "unknown"),
+            "attn_implementation": config.attn_implementation,
+            "distributed_gpu_count": config.distributed_gpu_count,
+        },
+        "dataset": {
+            "name": config.eval_dataset.name,
+            "config": config.eval_dataset.config,
+            "config_names": config.eval_dataset.config_names,
+            "split": config.eval_dataset.split,
+            "audio_column": audio_column,
+            "text_column": text_column,
+            "samples": len(dataset),
+        },
+        "baseline_label": baseline_label,
+        "candidates": candidates,
+        "overall_metrics": overall_metrics,
+        "deltas_vs_baseline": deltas_vs_baseline,
+        "oracle": _compute_oracle_summary(
+            raw_references=raw_references,
+            normalized_references=normalized_references,
+            raw_predictions_by_model=raw_predictions_by_model,
+            normalized_predictions_by_model=normalized_predictions_by_model,
+            baseline_label=baseline_label,
+        ),
+        "group_metrics": _summarize_group_metrics(
+            metadata_rows=metadata_rows,
+            normalized_references=normalized_references,
+            normalized_predictions_by_model=comparison_predictions,
+            group_fields=config.group_fields,
+            min_group_samples=config.min_group_samples,
+            max_groups_per_field=config.max_groups_per_field,
+        ),
+        "pairwise_vs_baseline": _summarize_pairwise_examples(
+            metadata_rows=metadata_rows,
+            raw_references=raw_references,
+            raw_predictions_by_model=comparison_raw_predictions,
+            normalized_references=normalized_references,
+            normalized_predictions_by_model=comparison_predictions,
+            top_examples=config.top_examples,
+        ),
+        "artifacts": {
+            "report_path": str(run_dir / "report.json"),
+            "pairwise_predictions_jsonl": str(pairwise_predictions_path),
+            "progress_path": str(_run_progress_path(run_dir)),
+        },
+    }
+    _write_json(run_dir / "report.json", report)
+    _write_run_progress(
+        run_dir,
+        {
+            "stage": "complete",
+            "updated_at_utc": _now_iso(),
+            "status": "complete",
+            "samples_total": len(dataset) * len(worker_payloads),
+            "candidates_total": len(worker_payloads),
+        },
+        commit=True,
+    )
+    artifacts_volume.commit()
+    hf_cache_volume.commit()
+    return report
+
+
+def _split_even_ranges(total: int, shards: int) -> list[tuple[int, int]]:
+    if total <= 0:
+        return []
+    shard_count = max(1, min(shards, total))
+    ranges: list[tuple[int, int]] = []
+    for shard_index in range(shard_count):
+        start = (total * shard_index) // shard_count
+        stop = (total * (shard_index + 1)) // shard_count
+        if start < stop:
+            ranges.append((start, stop))
+    return ranges
+
+
+def _load_hard_mining_dataset(config: HardExampleMiningConfig, *, token: str | None):
+    local_path = Path(config.dataset.name)
+    split_name = config.dataset.split or ""
+    if (
+        config.sample_limit > 0
+        and not local_path.exists()
+        and split_name
+        and "[" not in split_name
+    ):
+        dataset, audio_column, text_column = _load_dataset_slice(
+            config.dataset,
+            token=token,
+            rows=config.sample_limit,
+        )
+    else:
+        dataset, audio_column, text_column = _load_dataset_split(config.dataset, token=token)
+    dataset = _filter_dataset_require_text(dataset, text_column=text_column)
+    if len(dataset) > config.sample_limit:
+        dataset = _sample_dataset_rows(dataset, max_samples=config.sample_limit, seed=config.seed)
+    return dataset, audio_column, text_column
+
+
+def _hard_mining_worker_main(config_path: str) -> None:
+    import torch
+
+    payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    config = _normalize_hard_example_mining_config(payload["mining_config"])
+    role = str(payload["role"])
+    model_name = str(payload["model_name"])
+    shard_start = int(payload["shard_start"])
+    shard_stop = int(payload["shard_stop"])
+    phase_key = str(payload["phase_key"])
+    phase_name = str(payload["phase_name"])
+    progress_path = Path(payload["progress_path"])
+
+    hf_token = _get_hf_token()
+    _write_phase_progress(
+        progress_path,
+        {
+            "phase": phase_name,
+            "status": "loading_dataset",
+            "updated_at_utc": _now_iso(),
+            "samples_done": 0,
+            "samples_total": shard_stop - shard_start,
+            "batches_done": 0,
+            "batches_total": None,
+        },
+        commit=True,
+    )
+    processor = _build_processor(model_name, language=config.language, task=config.task)
+    dataset, audio_column, text_column = _load_hard_mining_dataset(config, token=hf_token)
+    shard_dataset = dataset.select(range(shard_start, shard_stop))
+    _write_phase_progress(
+        progress_path,
+        {
+            "phase": phase_name,
+            "status": "loading_model",
+            "updated_at_utc": _now_iso(),
+            "samples_done": 0,
+            "samples_total": shard_stop - shard_start,
+            "batches_done": 0,
+            "batches_total": None,
+        },
+        commit=True,
+    )
+    model = _load_base_model(
+        model_name,
+        attn_implementation=config.attn_implementation,
+    )
+    prediction_payload = _predict_dataset(
+        model=model,
+        processor=processor,
+        dataset=shard_dataset,
+        audio_column=audio_column,
+        text_column=text_column,
+        language=config.language,
+        task=config.task,
+        max_new_tokens=config.max_new_tokens,
+        batch_size=config.per_device_eval_batch_size,
+        phase_name=phase_name,
+        progress_path=progress_path,
+        progress_log_interval_batches=25,
+    )
+    result_payload = {
+        "phase_key": phase_key,
+        "phase_name": phase_name,
+        "role": role,
+        "model_name": model_name,
+        "shard_index": int(payload["shard_index"]),
+        "shards_total": int(payload["shards_total"]),
+        "shard_start": shard_start,
+        "shard_stop": shard_stop,
+        "sample_count": len(prediction_payload["references"]),
+        "predictions": prediction_payload["predictions"],
+        "references": prediction_payload["references"],
+        "normalized_predictions": prediction_payload["normalized_predictions"],
+        "normalized_references": prediction_payload["normalized_references"],
+        "metadata_rows": prediction_payload["metadata_rows"],
+    }
+    _write_phase_progress(Path(payload["output_path"]), result_payload, commit=True)
+    del model
+    torch.cuda.empty_cache()
+
+
+def _aggregate_hard_mining_progress(run_dir: Path, worker_payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    phases: dict[str, Any] = {}
+    samples_done = 0
+    samples_total = 0
+    for payload in worker_payloads:
+        samples_total += int(payload["sample_count"])
+        progress_path = Path(payload["progress_path"])
+        phase_state = {
+            "phase_name": payload["phase_name"],
+            "role": payload["role"],
+            "model_name": payload["model_name"],
+            "samples_total": int(payload["sample_count"]),
+            "samples_done": 0,
+            "batches_done": 0,
+            "batches_total": None,
+            "gpu_index": payload.get("gpu_index"),
+            "status": "pending",
+        }
+        if progress_path.exists():
+            phase_state.update(json.loads(progress_path.read_text(encoding="utf-8")))
+            status = str(phase_state.get("status") or "running")
+            phase_state["status"] = "running" if status == "pending" else status
+        if Path(payload["output_path"]).exists():
+            phase_state["status"] = "complete"
+            phase_state["samples_done"] = int(payload["sample_count"])
+        phases[payload["phase_key"]] = phase_state
+        samples_done += int(phase_state.get("samples_done", 0))
+
+    return {
+        "stage": "hard_example_mining",
+        "status": "predicting",
+        "updated_at_utc": _now_iso(),
+        "prediction": {
+            "samples_done": samples_done,
+            "samples_total": samples_total,
+            "percent_complete": (samples_done / samples_total) if samples_total else 0.0,
+            "phases": phases,
+        },
+    }
+
+
+def _collect_hard_mining_predictions(
+    *,
+    worker_payloads: list[dict[str, Any]],
+    total_samples: int,
+) -> dict[str, Any]:
+    roles = sorted({str(payload["role"]) for payload in worker_payloads})
+    collected = {
+        role: {
+            "predictions": [None] * total_samples,
+            "normalized_predictions": [None] * total_samples,
+            "references": [None] * total_samples,
+            "normalized_references": [None] * total_samples,
+            "metadata_rows": [None] * total_samples,
+        }
+        for role in roles
+    }
+
+    for payload in worker_payloads:
+        role = str(payload["role"])
+        result = json.loads(Path(payload["output_path"]).read_text(encoding="utf-8"))
+        shard_start = int(result["shard_start"])
+        for offset in range(int(result["sample_count"])):
+            index = shard_start + offset
+            collected[role]["predictions"][index] = result["predictions"][offset]
+            collected[role]["normalized_predictions"][index] = result["normalized_predictions"][offset]
+            collected[role]["references"][index] = result["references"][offset]
+            collected[role]["normalized_references"][index] = result["normalized_references"][offset]
+            collected[role]["metadata_rows"][index] = result["metadata_rows"][offset]
+
+    for role, payload in collected.items():
+        for key, values in payload.items():
+            if any(value is None for value in values):
+                missing = [index for index, value in enumerate(values) if value is None][:10]
+                raise RuntimeError(f"Missing hard-mining predictions for role={role} key={key} indexes={missing}")
+            payload[key] = list(values)
+    return collected
+
+
+def _passes_hard_mining_quality_gates(
+    *,
+    config: HardExampleMiningConfig,
+    raw_reference: str,
+    normalized_reference: str,
+    turbo_prediction: str,
+    teacher_prediction: str,
+    duration_seconds: float | None,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    from jiwer import cer, wer
+
+    flags = _text_quality_flags(raw_reference)
+    word_count = int(flags["word_count"])
+    if normalized_reference:
+        turbo_wer = wer(normalized_reference, turbo_prediction)
+        turbo_cer = cer(normalized_reference, turbo_prediction)
+        teacher_wer = wer(normalized_reference, teacher_prediction)
+        teacher_cer = cer(normalized_reference, teacher_prediction)
+    else:
+        turbo_wer = 0.0
+        turbo_cer = 0.0
+        teacher_wer = 0.0
+        teacher_cer = 0.0
+    reject_reasons: list[str] = []
+
+    if not normalized_reference:
+        reject_reasons.append("empty_reference")
+    if word_count < config.min_word_count:
+        reject_reasons.append("too_few_words")
+    if word_count > config.max_word_count:
+        reject_reasons.append("too_many_words")
+    if duration_seconds is None:
+        reject_reasons.append("missing_duration")
+    else:
+        if duration_seconds < config.min_duration_seconds:
+            reject_reasons.append("too_short")
+        if duration_seconds > config.max_duration_seconds:
+            reject_reasons.append("too_long")
+    if flags["contains_markup"]:
+        reject_reasons.append("contains_markup")
+    if flags["non_ascii_ratio"] > 0.05:
+        reject_reasons.append("high_non_ascii_ratio")
+    if config.reject_format_sensitive and (
+        flags["contains_digit"] or flags["contains_date_like"] or flags["contains_currency_or_amount"]
+    ):
+        reject_reasons.append("format_sensitive")
+
+    turbo_failed = turbo_cer >= config.turbo_min_cer or (
+        word_count >= config.turbo_min_wer_word_count and turbo_wer > 0.0
+    )
+    if not turbo_failed:
+        reject_reasons.append("turbo_not_hard")
+    if turbo_cer > config.turbo_max_cer:
+        reject_reasons.append("turbo_too_wrong")
+
+    teacher_passed = teacher_prediction == normalized_reference or teacher_cer <= config.teacher_max_cer
+    if not teacher_passed:
+        reject_reasons.append("teacher_not_clean")
+
+    score = (turbo_cer - teacher_cer) + 0.25 * (turbo_wer - teacher_wer)
+    if score < config.min_selection_score:
+        reject_reasons.append("selection_score_too_low")
+    metrics = {
+        "word_count": word_count,
+        "duration_seconds": duration_seconds,
+        "turbo_wer": turbo_wer,
+        "turbo_cer": turbo_cer,
+        "teacher_wer": teacher_wer,
+        "teacher_cer": teacher_cer,
+        "selection_score": score,
+        **flags,
+    }
+    return not reject_reasons, reject_reasons, metrics
+
+
+def _run_hard_example_mining_impl(config: HardExampleMiningConfig) -> dict[str, Any]:
+    import soundfile as sf
+    from transformers.models.whisper.english_normalizer import BasicTextNormalizer
+
+    hf_token = _get_hf_token()
+    mining_run_id = f"{config.mine_name}-{_now_utc()}"
+    run_dir = ARTIFACTS_DIR / mining_run_id
+    progress_dir = _run_progress_dir(run_dir)
+    audio_dir = run_dir / "audio"
+    _ensure_dir(progress_dir)
+    if config.export_audio:
+        _ensure_dir(audio_dir)
+    _write_run_progress(
+        run_dir,
+        {
+            "stage": "hard_example_mining",
+            "status": "loading_dataset",
+            "updated_at_utc": _now_iso(),
+            "dataset": {
+                "name": config.dataset.name,
+                "config": config.dataset.config,
+                "config_names": config.dataset.config_names,
+                "split": config.dataset.split,
+            },
+            "sample_limit": config.sample_limit,
+            "output_limit": config.output_limit,
+        },
+        commit=True,
+    )
+    dataset, audio_column, text_column = _load_hard_mining_dataset(config, token=hf_token)
+
+    shard_ranges = _split_even_ranges(len(dataset), max(1, config.distributed_gpu_count))
+    model_specs = [
+        {"role": "turbo", "model_name": config.base_model},
+        {"role": "teacher", "model_name": config.teacher_model},
+    ]
+    worker_payloads: list[dict[str, Any]] = []
+    for model_spec in model_specs:
+        for shard_index, (shard_start, shard_stop) in enumerate(shard_ranges):
+            phase_key = _sanitize_artifact_component(
+                f"{model_spec['role']}-shard-{shard_index + 1}-of-{len(shard_ranges)}"
+            )
+            worker_payloads.append(
+                {
+                    "phase_key": phase_key,
+                    "phase_name": (
+                        f"hard mine {model_spec['role']} shard "
+                        f"{shard_index + 1}/{len(shard_ranges)}"
+                    ),
+                    "role": model_spec["role"],
+                    "model_name": model_spec["model_name"],
+                    "shard_index": shard_index,
+                    "shards_total": len(shard_ranges),
+                    "shard_start": shard_start,
+                    "shard_stop": shard_stop,
+                    "sample_count": shard_stop - shard_start,
+                    "gpu_index": None,
+                    "progress_path": str(_phase_progress_path(run_dir, phase_key)),
+                    "output_path": str(progress_dir / f"{phase_key}.result.json"),
+                    "mining_config": asdict(config),
+                }
+            )
+
+    _write_run_progress(
+        run_dir,
+        {
+            "stage": "hard_example_mining",
+            "status": "starting",
+            "updated_at_utc": _now_iso(),
+            "rows_loaded": len(dataset),
+            "prediction_samples_total": len(dataset) * len(model_specs),
+            "workers_total": len(worker_payloads),
+            "output_limit": config.output_limit,
+            "distributed_gpu_count": config.distributed_gpu_count,
+        },
+        commit=True,
+    )
+
+    _run_worker_processes_bounded(
+        run_dir=run_dir,
+        worker_payloads=worker_payloads,
+        gpu_count=max(1, min(config.distributed_gpu_count, len(worker_payloads))),
+        worker_arg_name="--hard-mining-worker-config-path",
+        progress_builder=_aggregate_hard_mining_progress,
+        failure_label="Hard-example mining",
+    )
+
+    collected = _collect_hard_mining_predictions(
+        worker_payloads=worker_payloads,
+        total_samples=len(dataset),
+    )
+    raw_references = collected["turbo"]["references"]
+    normalized_references = collected["turbo"]["normalized_references"]
+    turbo_predictions = collected["turbo"]["normalized_predictions"]
+    teacher_predictions = collected["teacher"]["normalized_predictions"]
+    metadata_rows = collected["turbo"]["metadata_rows"]
+
+    rejection_counts: dict[str, int] = {}
+    candidates: list[dict[str, Any]] = []
+    rng = random.Random(config.seed)
+    for index, normalized_reference in enumerate(normalized_references):
+        row = dataset[index]
+        raw_reference = str(raw_references[index] or "")
+        keep, reject_reasons, metrics = _passes_hard_mining_quality_gates(
+            config=config,
+            raw_reference=raw_reference,
+            normalized_reference=str(normalized_reference or ""),
+            turbo_prediction=str(turbo_predictions[index] or ""),
+            teacher_prediction=str(teacher_predictions[index] or ""),
+            duration_seconds=_row_duration_seconds(row, audio_column=audio_column),
+        )
+        for reason in reject_reasons:
+            rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+        if not keep:
+            continue
+        speaker_key = _speaker_key(metadata_rows[index])
+        if speaker_key == "unknown":
+            speaker_key = f"unknown-{index}"
+        candidates.append(
+            {
+                "dataset_index": index,
+                "speaker_key": speaker_key,
+                "normalized_text": str(normalized_reference or ""),
+                "metrics": metrics,
+                "tie_breaker": rng.random(),
+            }
+        )
+
+    candidates.sort(
+        key=lambda item: (
+            -float(item["metrics"]["selection_score"]),
+            float(item["metrics"]["teacher_cer"]),
+            item["tie_breaker"],
+        )
+    )
+    selected: list[dict[str, Any]] = []
+    speaker_counts: dict[str, int] = {}
+    seen_texts: set[str] = set()
+    for candidate in candidates:
+        if len(selected) >= config.output_limit:
+            break
+        normalized_text = str(candidate["normalized_text"]).strip()
+        if config.dedupe_text and normalized_text in seen_texts:
+            rejection_counts["duplicate_text"] = rejection_counts.get("duplicate_text", 0) + 1
+            continue
+        speaker_key = str(candidate["speaker_key"])
+        if speaker_counts.get(speaker_key, 0) >= config.max_samples_per_speaker:
+            rejection_counts["speaker_cap"] = rejection_counts.get("speaker_cap", 0) + 1
+            continue
+        selected.append(candidate)
+        if normalized_text:
+            seen_texts.add(normalized_text)
+        speaker_counts[speaker_key] = speaker_counts.get(speaker_key, 0) + 1
+
+    _write_run_progress(
+        run_dir,
+        {
+            "stage": "hard_example_mining",
+            "status": "exporting",
+            "updated_at_utc": _now_iso(),
+            "rows_loaded": len(dataset),
+            "candidate_rows": len(candidates),
+            "selected_rows": len(selected),
+            "exported_rows": 0,
+            "output_limit": config.output_limit,
+        },
+        commit=True,
+    )
+
+    transcript_normalizer = BasicTextNormalizer() if config.normalize_transcripts else None
+    metadata_fields = config.metadata_fields or _default_audit_metadata_fields(list(metadata_rows[0].keys()) if metadata_rows else [])
+    manifest_rows: list[dict[str, Any]] = []
+    transcript_values: list[str] = []
+    duration_values: list[float] = []
+    for selected_index, candidate in enumerate(selected, start=1):
+        dataset_index = int(candidate["dataset_index"])
+        row = dataset[dataset_index]
+        raw_transcript = str(raw_references[dataset_index] or "")
+        transcript = (
+            _clean_transcript_text(raw_transcript, normalizer=transcript_normalizer)
+            if transcript_normalizer is not None
+            else _strip_transcript_markup(raw_transcript)
+        )
+        audio_relative_path = ""
+        artifact_audio_file = ""
+        if config.export_audio:
+            audio = row[audio_column]
+            audio_relative_path = f"audio/{selected_index:06d}.wav"
+            artifact_audio_file = f"{mining_run_id}/{audio_relative_path}"
+            sf.write(
+                str(run_dir / audio_relative_path),
+                _normalize_audio_array(audio["array"]),
+                int(audio["sampling_rate"]),
+            )
+
+        metrics = candidate["metrics"]
+        if metrics["duration_seconds"] is not None:
+            duration_values.append(float(metrics["duration_seconds"]))
+        transcript_values.append(transcript.lower())
+
+        manifest_row = {
+            "manifest_index": selected_index,
+            "dataset_index": dataset_index,
+            "audio": artifact_audio_file,
+            "text": transcript,
+            "raw_transcript": raw_transcript,
+            "source_dataset": config.dataset.name,
+            "source_config": config.dataset.config,
+            "source_split": config.dataset.split,
+            "speaker_key": candidate["speaker_key"],
+            "audio_file": audio_relative_path,
+            "turbo_prediction": collected["turbo"]["predictions"][dataset_index],
+            "teacher_prediction": collected["teacher"]["predictions"][dataset_index],
+            **metrics,
+        }
+        metadata_row = metadata_rows[dataset_index]
+        for field_name in metadata_fields:
+            manifest_row[field_name] = metadata_row.get(field_name)
+        manifest_rows.append(manifest_row)
+
+        if selected_index % 250 == 0 or selected_index == len(selected):
+            print(f"[hard-mine:{mining_run_id}] exported {selected_index}/{len(selected)}")
+            _write_run_progress(
+                run_dir,
+                {
+                    "stage": "hard_example_mining",
+                    "status": "exporting",
+                    "updated_at_utc": _now_iso(),
+                    "rows_loaded": len(dataset),
+                    "candidate_rows": len(candidates),
+                    "selected_rows": len(selected),
+                    "exported_rows": selected_index,
+                    "output_limit": config.output_limit,
+                },
+                commit=True,
+            )
+
+    manifest_columns = list(manifest_rows[0].keys()) if manifest_rows else []
+    manifest_csv_path = run_dir / "manifest.csv"
+    with manifest_csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=manifest_columns)
+        if manifest_columns:
+            writer.writeheader()
+        for row in manifest_rows:
+            writer.writerow({key: _csv_safe_value(value) for key, value in row.items()})
+
+    manifest_jsonl_path = run_dir / "manifest.jsonl"
+    with manifest_jsonl_path.open("w", encoding="utf-8") as handle:
+        for row in manifest_rows:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            handle.write("\n")
+
+    training_jsonl_path = run_dir / "train.jsonl"
+    with training_jsonl_path.open("w", encoding="utf-8") as handle:
+        for row in manifest_rows:
+            handle.write(
+                json.dumps(
+                    {
+                        "audio": row["audio"],
+                        "text": row["text"],
+                        "source_dataset": row["source_dataset"],
+                        "dataset_index": row["dataset_index"],
+                        "selection_score": row["selection_score"],
+                        "turbo_cer": row["turbo_cer"],
+                        "teacher_cer": row["teacher_cer"],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            handle.write("\n")
+
+    report = {
+        "created_at_utc": datetime.now(tz=UTC).isoformat(),
+        "mining_run_id": mining_run_id,
+        "runtime": {
+            "modal_gpu": os.environ.get("MODAL_GPU_LABEL", "unknown"),
+            "attn_implementation": config.attn_implementation,
+            "distributed_gpu_count": config.distributed_gpu_count,
+        },
+        "dataset": {
+            "name": config.dataset.name,
+            "config": config.dataset.config,
+            "config_names": config.dataset.config_names,
+            "split": config.dataset.split,
+            "rows_loaded": len(dataset),
+            "audio_column": audio_column,
+            "text_column": text_column,
+            "metadata_fields": metadata_fields,
+        },
+        "models": {
+            "turbo": config.base_model,
+            "teacher": config.teacher_model,
+        },
+        "prediction_metrics": {
+            "turbo": _compute_text_metrics(normalized_references, turbo_predictions),
+            "teacher": _compute_text_metrics(normalized_references, teacher_predictions),
+        },
+        "selection": {
+            "sample_limit": config.sample_limit,
+            "output_limit": config.output_limit,
+            "candidate_rows": len(candidates),
+            "selected_rows": len(manifest_rows),
+            "max_samples_per_speaker": config.max_samples_per_speaker,
+            "unique_speakers": len(speaker_counts),
+            "selected_duration_seconds": _summarize_numeric_values(duration_values),
+            "selected_duplicate_texts": [
+                item for item in _top_counts(transcript_values, limit=20) if item["count"] > 1
+            ],
+            "rejection_counts": dict(sorted(rejection_counts.items(), key=lambda item: (-item[1], item[0]))),
+            "filters": {
+                "min_word_count": config.min_word_count,
+                "max_word_count": config.max_word_count,
+                "min_duration_seconds": config.min_duration_seconds,
+                "max_duration_seconds": config.max_duration_seconds,
+                "turbo_min_cer": config.turbo_min_cer,
+                "turbo_max_cer": config.turbo_max_cer,
+                "teacher_max_cer": config.teacher_max_cer,
+                "min_selection_score": config.min_selection_score,
+                "reject_format_sensitive": config.reject_format_sensitive,
+                "dedupe_text": config.dedupe_text,
+            },
+        },
+        "artifacts": {
+            "manifest_dir": str(run_dir),
+            "manifest_csv": str(manifest_csv_path),
+            "manifest_jsonl": str(manifest_jsonl_path),
+            "training_jsonl": str(training_jsonl_path),
+            "audio_dir": str(audio_dir) if config.export_audio else None,
+            "progress_path": str(_run_progress_path(run_dir)),
+        },
+    }
+    _write_json(run_dir / "report.json", report)
+    _write_run_progress(
+        run_dir,
+        {
+            "stage": "complete",
+            "status": "complete",
+            "updated_at_utc": _now_iso(),
+            "rows_loaded": len(dataset),
+            "candidate_rows": len(candidates),
+            "selected_rows": len(manifest_rows),
+            "exported_rows": len(manifest_rows),
+            "report_path": str(run_dir / "report.json"),
+        },
+        commit=True,
+    )
+    artifacts_volume.commit()
+    hf_cache_volume.commit()
+    return report
+
+
 def _distributed_worker_main(config_path: str) -> None:
     from datasets import load_from_disk
     from torch import distributed as dist
@@ -5552,6 +6754,36 @@ def analyze_svarah_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
     return _analyze_svarah_impl(config)
 
 
+@app.function(
+    gpu=FIVE_GPU_TRAIN_GPU,
+    timeout=60 * 60 * 4,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={
+        str(ARTIFACTS_DIR): artifacts_volume,
+        str(HF_CACHE_DIR): hf_cache_volume,
+    },
+)
+def svarah_inference_sweep_5gpu_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
+    os.environ["MODAL_GPU_LABEL"] = FIVE_GPU_TRAIN_GPU
+    config = _normalize_svarah_inference_sweep_config(config_payload)
+    return _run_svarah_inference_sweep_impl(config)
+
+
+@app.function(
+    gpu=FIVE_GPU_TRAIN_GPU,
+    timeout=60 * 60 * 6,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={
+        str(ARTIFACTS_DIR): artifacts_volume,
+        str(HF_CACHE_DIR): hf_cache_volume,
+    },
+)
+def hard_example_mining_5gpu_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
+    os.environ["MODAL_GPU_LABEL"] = FIVE_GPU_TRAIN_GPU
+    config = _normalize_hard_example_mining_config(config_payload)
+    return _run_hard_example_mining_impl(config)
+
+
 @app.local_entrypoint()
 def main(
     mode: str = "train_eval",
@@ -5653,6 +6885,21 @@ def main(
     analysis_min_group_samples: int = 100,
     analysis_max_groups_per_field: int = 12,
     analysis_top_examples: int = 5,
+    sweep_name: str = "svarah-inference-sweep",
+    sweep_base_models: str = BASE_MODEL,
+    sweep_adapter_scales: str = "1.0",
+    hard_base_model: str = BASE_MODEL,
+    hard_teacher_model: str = "openai/whisper-large-v3",
+    hard_min_word_count: int = 4,
+    hard_max_word_count: int = 16,
+    hard_min_duration_seconds: float = 1.5,
+    hard_max_duration_seconds: float = 8.0,
+    hard_turbo_min_cer: float = 0.04,
+    hard_turbo_max_cer: float = 0.35,
+    hard_teacher_max_cer: float = 0.02,
+    hard_min_selection_score: float = 0.03,
+    hard_reject_format_sensitive: bool = True,
+    hard_dedupe_text: bool = True,
     profile_sample_limit: int = 0,
     profile_short_word_threshold: int = 5,
     existing_run_id: str = "",
@@ -5849,6 +7096,38 @@ def main(
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
 
+    if mode == "build_hard_example_manifest":
+        hard_config = HardExampleMiningConfig(
+            mine_name=manifest_name,
+            dataset=train_dataset_config,
+            base_model=hard_base_model,
+            teacher_model=hard_teacher_model,
+            attn_implementation=attn_implementation,
+            max_new_tokens=256,
+            per_device_eval_batch_size=per_device_eval_batch_size,
+            distributed_gpu_count=distributed_gpu_count,
+            sample_limit=manifest_sample_limit,
+            output_limit=manifest_output_limit,
+            seed=audit_seed,
+            min_word_count=hard_min_word_count,
+            max_word_count=hard_max_word_count,
+            min_duration_seconds=hard_min_duration_seconds,
+            max_duration_seconds=hard_max_duration_seconds,
+            turbo_min_cer=hard_turbo_min_cer,
+            turbo_max_cer=hard_turbo_max_cer,
+            teacher_max_cer=hard_teacher_max_cer,
+            min_selection_score=hard_min_selection_score,
+            reject_format_sensitive=hard_reject_format_sensitive,
+            dedupe_text=hard_dedupe_text,
+            max_samples_per_speaker=manifest_max_samples_per_speaker,
+            export_audio=manifest_export_audio,
+            normalize_transcripts=manifest_normalize_transcripts,
+            metadata_fields=[field.strip() for field in manifest_metadata_fields.split(",") if field.strip()],
+        )
+        payload = hard_example_mining_5gpu_remote.remote(asdict(hard_config))
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
     if mode == "verify_audio_manifest":
         verify_config = AudioManifestVerifyConfig(
             verify_name=audio_verify_name,
@@ -5903,6 +7182,49 @@ def main(
             group_fields=[field.strip() for field in analysis_group_fields.split(",") if field.strip()],
         )
         payload = analyze_svarah_remote.remote(asdict(analysis_config))
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    if mode == "svarah_inference_sweep":
+        base_models = _parse_config_names(sweep_base_models)
+        if not base_models:
+            raise ValueError("sweep_base_models must include at least one model")
+        adapter_scales = _parse_float_list(sweep_adapter_scales)
+        if not adapter_scales:
+            raise ValueError("sweep_adapter_scales must include at least one scale")
+        run_ids = [value.strip() for value in compare_run_ids.split(",") if value.strip()]
+        labels = [value.strip() for value in compare_labels.split(",") if value.strip()]
+        if labels and len(labels) != len(run_ids):
+            raise ValueError("compare_labels must match compare_run_ids length when provided")
+
+        adapter_runs = []
+        for index, run_id in enumerate(run_ids):
+            label = labels[index] if labels else f"adapter_{index + 1}"
+            adapter_runs.append(
+                {
+                    "label": label,
+                    "run_id": run_id,
+                    "adapter_dir": str(ARTIFACTS_DIR / run_id / "adapter"),
+                    "base_model": base_models[0],
+                }
+            )
+
+        sweep_config = SvarahInferenceSweepConfig(
+            sweep_name=sweep_name,
+            eval_dataset=eval_dataset_config,
+            base_models=base_models,
+            adapter_runs=adapter_runs,
+            adapter_scales=adapter_scales,
+            attn_implementation=attn_implementation,
+            max_new_tokens=256,
+            per_device_eval_batch_size=per_device_eval_batch_size,
+            distributed_gpu_count=distributed_gpu_count,
+            min_group_samples=analysis_min_group_samples,
+            max_groups_per_field=analysis_max_groups_per_field,
+            top_examples=analysis_top_examples,
+            group_fields=[field.strip() for field in analysis_group_fields.split(",") if field.strip()],
+        )
+        payload = svarah_inference_sweep_5gpu_remote.remote(asdict(sweep_config))
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
 
@@ -6018,7 +7340,7 @@ def main(
     if mode != "train_eval":
         raise ValueError(
             "Unsupported mode "
-            f"'{mode}'. Expected one of: train_eval, train_only, evaluate_saved_run, profile_train_selection, inspect_train, inspect_eval, profile_train, profile_anchor, survey_train_configs, download_external_archives, build_audit_manifest, build_training_manifest, verify_audio_manifest, benchmark_step, analyze_svarah"
+            f"'{mode}'. Expected one of: train_eval, train_only, evaluate_saved_run, profile_train_selection, inspect_train, inspect_eval, profile_train, profile_anchor, survey_train_configs, download_external_archives, build_audit_manifest, build_training_manifest, build_hard_example_manifest, verify_audio_manifest, benchmark_step, analyze_svarah, svarah_inference_sweep"
         )
 
     if distributed_gpu_count == 4:
@@ -6047,4 +7369,20 @@ if __name__ == "__main__" and "--eval-worker-config-path" in sys.argv:
     if not worker_args:
         raise SystemExit("--eval-worker-config-path requires a value")
     _eval_worker_main(worker_args[0])
+    raise SystemExit(0)
+
+
+if __name__ == "__main__" and "--svarah-sweep-worker-config-path" in sys.argv:
+    worker_args = sys.argv[sys.argv.index("--svarah-sweep-worker-config-path") + 1 :]
+    if not worker_args:
+        raise SystemExit("--svarah-sweep-worker-config-path requires a value")
+    _svarah_sweep_worker_main(worker_args[0])
+    raise SystemExit(0)
+
+
+if __name__ == "__main__" and "--hard-mining-worker-config-path" in sys.argv:
+    worker_args = sys.argv[sys.argv.index("--hard-mining-worker-config-path") + 1 :]
+    if not worker_args:
+        raise SystemExit("--hard-mining-worker-config-path requires a value")
+    _hard_mining_worker_main(worker_args[0])
     raise SystemExit(0)

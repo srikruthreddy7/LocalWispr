@@ -12,11 +12,13 @@ April 23 update:
 
 - the curated Common Voice 1k run did not beat base Whisper on full Svarah
 - the bucketed transfer 1k run also did not beat base Whisper on full Svarah
-- the next step should be stricter data evidence, not a larger run from the same selection logic
+- the inference-only Svarah sweep found that no existing adapter scale beats turbo
+- plain `openai/whisper-large-v3` beats turbo by a meaningful margin on full Svarah
+- the next step is stricter hard-example mining, not a larger run from the same selection logic
 
 ## Current conclusion
 
-The strongest verified recipe so far is:
+The strongest previously verified LoRA recipe was:
 
 - dataset: `WillHeld/india_accent_cv`
 - LoRA: attention-only
@@ -26,9 +28,135 @@ The strongest verified recipe so far is:
 - dropout: `0.05`
 - epochs: `0.5`
 
-That recipe beats base Whisper on full Svarah by a tiny margin, but it still misses the stricter accent-only target by a tiny margin.
+The current full-Svarah sweep re-evaluated that adapter family at multiple scales and found that it no longer beats the current turbo baseline. The best old scale was `0.5`, with WER `0.0814790435` against turbo WER `0.0813502569`.
 
 That means the next improvement should come from better data, not from spending more runs on the same sources.
+
+The next data build should use hard-example mining:
+
+1. Run `openai/whisper-large-v3-turbo` on candidate Indian-accent pools.
+2. Run `openai/whisper-large-v3` as a stronger teacher/check model.
+3. Keep rows where turbo makes a real error but large-v3 agrees with the transcript.
+4. Reject rows where both models fail, labels look noisy, text is duplicated, or metadata/audio gates are weak.
+5. Train only a small `1024`-row adapter first.
+
+Candidate pools:
+
+- `ishands/commonvoice-indian_accent`: primary hard-example pool
+- `WillHeld/india_accent_cv`: proven source, still useful for mined rows
+- Vaani English-heavy districts: capped supplement only
+- Indic-TIMIT: exclude from the next main run because the prior recipes hurt Svarah transfer
+
+Initial hard-example filters:
+
+- turbo `CER >= 0.04` or non-zero WER on `3+` word utterances
+- large-v3 `CER <= 0.02` or exact normalized match
+- reject turbo `CER > 0.35`
+- reject digit/date/currency rows for the first mined run
+- duration `1.5-8s`, with most quota in `3-6s`
+- word count `4-16`
+- speaker cap `4-8`
+
+The inference sweep also showed a large routing/teacher signal:
+
+- turbo WER/CER: `0.0813502569` / `0.0387159934`
+- large-v3 WER/CER: `0.0717341843` / `0.0347099134`
+- best LoRA WER/CER: `0.0814790435` / `0.0387700948`
+- oracle across turbo, large-v3, and adapter scales: WER/CER `0.0561796145` / `0.0259454864`
+
+Practical read:
+
+- use large-v3 to find and verify rows, not as another LoRA baseline to beat by luck
+- mine cases where turbo fails and large-v3 is right
+- avoid rows where both Whisper variants disagree with the transcript
+- keep Svarah evaluation-only
+
+Implemented mining path:
+
+```bash
+modal run tools/modal_whisper_lora_experiment.py \
+  --mode build_hard_example_manifest \
+  --manifest-name hard-mine-cv-indian-largev3-v1 \
+  --train-dataset ishands/commonvoice-indian_accent \
+  --train-split train \
+  --train-audio-column audio \
+  --train-text-column sentence \
+  --manifest-sample-limit 10000 \
+  --manifest-output-limit 1024 \
+  --manifest-max-samples-per-speaker 8 \
+  --hard-min-word-count 4 \
+  --hard-max-word-count 16 \
+  --hard-min-duration-seconds 1.5 \
+  --hard-max-duration-seconds 8.0 \
+  --hard-turbo-min-cer 0.04 \
+  --hard-turbo-max-cer 0.35 \
+  --hard-teacher-max-cer 0.02 \
+  --hard-min-selection-score 0.03 \
+  --hard-dedupe-text \
+  --per-device-eval-batch-size 8 \
+  --distributed-gpu-count 5
+```
+
+This exports:
+
+- `manifest.csv` for audit
+- `manifest.jsonl` with predictions, metrics, and metadata
+- `train.jsonl` for the next small adapter run
+- per-shard progress files so the run has no eval blind spot
+
+Smoke result:
+
+- run id: `hard-mine-smoke-v1-20260423-221038`
+- input rows: `64`
+- selected rows: `6`
+- selected rows had duration range `2.424s` to `7.56s`
+- turbo WER/CER on the smoke slice: `0.1614420063` / `0.0736047452`
+- large-v3 WER/CER on the smoke slice: `0.1363636364` / `0.0660555406`
+
+This validates the mining wiring. The next data step is the `10000`-row candidate pass from the same source, then a quick audit of the selected `1024` before training.
+
+10k result:
+
+- run id: `hard-mine-cv-indian-largev3-v1-20260423-221358`
+- input rows: `10000`
+- candidate rows after gates: `954`
+- selected rows exported by the original run: `954`
+- unique speakers: `652`
+- turbo WER/CER on source slice: `0.0862303360` / `0.0397203248`
+- large-v3 WER/CER on source slice: `0.0764873438` / `0.0348137764`
+- selected duration range: `1.872s` to `7.968s`
+- selected duration mean: `5.5302s`
+
+Audit:
+
+- `14` duplicate text groups, `30` duplicate rows
+- `703` rows have selection score `>= 0.03`
+- `693` rows remain after exact normalized-text dedupe at score `>= 0.03`
+- top rows look like real accent/phonetic failures, for example turbo hears "events treat all" for "went straight home", while large-v3 gets the transcript exactly
+
+Decision:
+
+- do not train on the raw `954` without filtering
+- use the stricter `~693` row deduped subset first
+- if that beats base or gets close, expand the mining sample beyond `10000` rows
+
+Filtered subset materialized:
+
+- artifact id: `hard-mine-cv-indian-largev3-v1-filtered-score003-dedup`
+- rows: `693`
+- training JSONL: `/artifacts/hard-mine-cv-indian-largev3-v1-filtered-score003-dedup/train.jsonl`
+- manifest JSONL: `/artifacts/hard-mine-cv-indian-largev3-v1-filtered-score003-dedup/manifest.jsonl`
+- report: `/artifacts/hard-mine-cv-indian-largev3-v1-filtered-score003-dedup/report.json`
+
+This is the next training input, not the raw `954` row manifest.
+
+Audio verification passed:
+
+- run id: `hard-mine-filtered-score003-dedup-verify-20260424-162938`
+- rows checked: `693`
+- valid rows: `693`
+- failed rows: `0`
+- all files are mono `16 kHz`
 
 ## Target data profile
 
@@ -1134,6 +1262,63 @@ Read:
 - restoring the old duration/context distribution was not enough to reproduce the old tiny base-beating result
 - do not scale this recipe to `2048` or `4096`
 - the next improvement needs better evidence that selected rows are genuinely useful Indian-accent supervision, not just longer Common Voice utterances
+
+## April 23 inference-only Svarah sweep
+
+Executed sweep:
+
+```bash
+modal run tools/modal_whisper_lora_experiment.py \
+  --mode svarah_inference_sweep \
+  --sweep-name svarah-inference-sweep-v1 \
+  --sweep-base-models openai/whisper-large-v3-turbo,openai/whisper-large-v3 \
+  --compare-run-ids whisper-turbo-accent-probe-cv-ultragentle-v1-20260421-152853,whisper-turbo-accent-bucketed-transfer-1k-v1-20260423-204820 \
+  --compare-labels old_cv_ultragentle,bucketed_transfer_1k \
+  --sweep-adapter-scales 0.125,0.25,0.375,0.5,0.75,1.0 \
+  --per-device-eval-batch-size 8 \
+  --distributed-gpu-count 5
+```
+
+Run details:
+
+- run id: `svarah-inference-sweep-v1-20260423-213839`
+- report: `/artifacts/svarah-inference-sweep-v1-20260423-213839/report.json`
+- pairwise predictions: `/artifacts/svarah-inference-sweep-v1-20260423-213839/pairwise_predictions.jsonl`
+- Modal GPU: `H100!:5`
+- samples: full Svarah test split, `6656`
+
+Overall metrics:
+
+| Candidate | WER | CER | Delta WER vs turbo |
+| --- | ---: | ---: | ---: |
+| `openai/whisper-large-v3` | `0.0717341843` | `0.0347099134` | `-0.0096160726` |
+| `openai/whisper-large-v3-turbo` | `0.0813502569` | `0.0387159934` | `0` |
+| `old_cv_ultragentle@0.5` | `0.0814790435` | `0.0387700948` | `+0.0001287867` |
+| `bucketed_transfer_1k@0.5` | `0.0818510940` | `0.0389813479` | `+0.0005008371` |
+| `bucketed_transfer_1k@1` | `0.0819083325` | `0.0388757214` | `+0.0005580756` |
+
+Oracle:
+
+| Metric | Value |
+| --- | ---: |
+| Oracle WER | `0.0561796145` |
+| Oracle CER | `0.0259454864` |
+| Oracle delta WER vs turbo | `-0.0251706424` |
+| Oracle delta CER vs turbo | `-0.0127705070` |
+
+Oracle choices:
+
+- turbo: `5398`
+- large-v3: `1138`
+- all bucketed-transfer scales combined: `100`
+- all old-ultragentle scales combined: `20`
+
+Read:
+
+- the adapter effects are too small and mostly negative
+- `large-v3` is the only reliable single-model improvement
+- the data signal should come from turbo-fail / large-v3-pass rows
+- a confidence router could be useful if runtime cost is acceptable, but the training path should first mine cleaner hard examples
 
 ## Legacy full-run template
 
