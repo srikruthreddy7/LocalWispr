@@ -137,7 +137,7 @@ class TrainConfig:
     alpha: int = 32
     dropout: float = 0.05
     weight_decay: float = 0.0
-    gradient_checkpointing: bool = True
+    gradient_checkpointing: bool = False
     dataloader_num_workers: int = 2
     preprocess_num_workers: int = 0
     preprocess_batch_size: int = 8
@@ -179,7 +179,7 @@ class AnalysisConfig:
     per_device_eval_batch_size: int = 4
     min_group_samples: int = 100
     max_groups_per_field: int = 12
-    top_examples: int = 5
+    top_examples: int = 0
     row_filters: dict[str, str] = field(default_factory=dict)
     group_fields: list[str] = field(
         default_factory=lambda: [
@@ -198,8 +198,78 @@ class AnalysisConfig:
 
 
 @dataclass
+class SavedEvalAnalysisConfig:
+    analysis_name: str = "saved-svarah-analysis"
+    source_run_id: str = ""
+    adapter_label: str = "adapter"
+    eval_dataset: DatasetConfig = field(
+        default_factory=lambda: DatasetConfig(
+            name="ai4bharat/Svarah",
+            split="test",
+        )
+    )
+    min_group_samples: int = 100
+    max_groups_per_field: int = 12
+    top_examples: int = 0
+    row_filters: dict[str, str] = field(default_factory=dict)
+    group_fields: list[str] = field(
+        default_factory=lambda: [
+            "duration_bucket",
+            "word_count_bucket",
+            "contains_digit",
+            "contains_date_like",
+            "contains_currency_or_amount",
+            "gender",
+            "age-group",
+            "primary_language",
+            "native_place_state",
+            "occupation_domain",
+        ]
+    )
+
+
+@dataclass
+class AdapterDatasetEvalConfig:
+    eval_name: str = "adapter-dataset-eval"
+    source_run_id: str = ""
+    adapter_label: str = "adapter"
+    base_model: str = BASE_MODEL
+    attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION
+    eval_dataset: DatasetConfig = field(
+        default_factory=lambda: DatasetConfig(
+            name="ai4bharat/Svarah",
+            split="test",
+        )
+    )
+    language: str = "english"
+    task: str = "transcribe"
+    max_new_tokens: int = 256
+    per_device_eval_batch_size: int = 4
+    min_group_samples: int = 100
+    max_groups_per_field: int = 12
+    top_examples: int = 0
+    group_fields: list[str] = field(
+        default_factory=lambda: [
+            "duration_bucket",
+            "word_count_bucket",
+            "contains_digit",
+            "contains_date_like",
+            "contains_currency_or_amount",
+            "gender",
+            "age-group",
+            "primary_language",
+            "native_place_state",
+            "occupation_domain",
+            "language_shard",
+            "mix_source",
+        ]
+    )
+
+
+@dataclass
 class SvarahInferenceSweepConfig:
     sweep_name: str = "svarah-inference-sweep"
+    run_id: str = ""
     eval_dataset: DatasetConfig = field(
         default_factory=lambda: DatasetConfig(
             name="ai4bharat/Svarah",
@@ -217,7 +287,7 @@ class SvarahInferenceSweepConfig:
     distributed_gpu_count: int = 5
     min_group_samples: int = 100
     max_groups_per_field: int = 12
-    top_examples: int = 5
+    top_examples: int = 0
     group_fields: list[str] = field(
         default_factory=lambda: [
             "duration_bucket",
@@ -269,6 +339,32 @@ class HardExampleMiningConfig:
     export_audio: bool = True
     normalize_transcripts: bool = True
     metadata_fields: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AdapterMergeSource:
+    run_id: str
+    weight: float
+    label: str = ""
+    adapter_dir: str = ""
+    base_model: str = BASE_MODEL
+
+
+@dataclass
+class AdapterMergeRecipe:
+    label: str
+    sources: list[AdapterMergeSource]
+
+
+@dataclass
+class AdapterMergeConfig:
+    merge_name: str = "adapter-merge"
+    recipes: list[AdapterMergeRecipe] = field(default_factory=list)
+    base_model: str = BASE_MODEL
+    attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION
+    language: str = "english"
+    task: str = "transcribe"
+    combination_type: str = "linear"
 
 
 @dataclass
@@ -324,6 +420,8 @@ class TrainingManifestConfig:
     export_audio: bool = True
     normalize_transcripts: bool = True
     metadata_fields: list[str] = field(default_factory=list)
+    balance_fields: list[str] = field(default_factory=list)
+    exclude_manifest_paths: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -339,6 +437,7 @@ class DatasetConfigSurveyConfig:
     config_names: list[str] = field(default_factory=list)
     max_configs: int | None = None
     max_workers: int = 6
+    max_rows_per_config: int | None = None
     sample_transcripts_per_config: int = 3
     top_k: int = 25
 
@@ -356,6 +455,7 @@ class AudioManifestVerifyConfig:
     )
     sample_limit: int | None = None
     seed: int = 42
+    max_workers: int = 32
 
 
 @dataclass
@@ -421,6 +521,108 @@ def _run_progress_dir(run_dir: Path) -> Path:
     return run_dir / "progress"
 
 
+def _safe_progress_candidate(candidate: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(candidate, dict):
+        return None
+    return {
+        "label": candidate.get("label"),
+        "model_role": candidate.get("model_role"),
+        "base_model": candidate.get("base_model"),
+        "adapter_run_id": candidate.get("adapter_run_id"),
+        "adapter_scale": candidate.get("adapter_scale"),
+    }
+
+
+def _safe_monitor_progress(progress: dict[str, Any]) -> dict[str, Any]:
+    phases: dict[str, Any] = {}
+    raw_eval = progress.get("eval")
+    raw_phases = None
+    if isinstance(raw_eval, dict):
+        raw_phases = raw_eval.get("phases")
+    if raw_phases is None:
+        raw_phases = progress.get("phases")
+    if isinstance(raw_phases, dict):
+        for phase_key, phase in raw_phases.items():
+            if not isinstance(phase, dict):
+                continue
+            phases[str(phase_key)] = {
+                "phase_name": phase.get("phase_name") or phase.get("phase"),
+                "candidate": _safe_progress_candidate(phase.get("candidate")),
+                "status": phase.get("status"),
+                "gpu_index": phase.get("gpu_index"),
+                "samples_done": phase.get("samples_done"),
+                "samples_total": phase.get("samples_total"),
+                "batches_done": phase.get("batches_done"),
+                "batches_total": phase.get("batches_total"),
+                "updated_at_utc": phase.get("updated_at_utc"),
+            }
+
+    return {
+        "stage": progress.get("stage"),
+        "status": progress.get("status"),
+        "updated_at_utc": progress.get("updated_at_utc"),
+        "samples_done": (raw_eval or {}).get("samples_done") if isinstance(raw_eval, dict) else progress.get("samples_done"),
+        "samples_total": (raw_eval or {}).get("samples_total") if isinstance(raw_eval, dict) else progress.get("samples_total"),
+        "percent_complete": (raw_eval or {}).get("percent_complete") if isinstance(raw_eval, dict) else progress.get("percent_complete"),
+        "phases": phases,
+    }
+
+
+def _safe_monitor_report(report: dict[str, Any]) -> dict[str, Any]:
+    candidates = report.get("candidates")
+    return {
+        "run_id": report.get("sweep_run_id") or report.get("eval_run_id") or report.get("run_id"),
+        "runtime": report.get("runtime"),
+        "dataset": report.get("dataset"),
+        "baseline_label": report.get("baseline_label"),
+        "candidates": [
+            _safe_progress_candidate(candidate)
+            for candidate in candidates
+            if isinstance(candidate, dict)
+        ]
+        if isinstance(candidates, list)
+        else None,
+        "overall_metrics": report.get("overall_metrics"),
+        "deltas_vs_baseline": report.get("deltas_vs_baseline") or report.get("deltas_vs_base"),
+    }
+
+
+def _sweep_artifact_status(run_id: str) -> dict[str, Any]:
+    safe_run_id = _sanitize_artifact_component(run_id)
+    run_dir = ARTIFACTS_DIR / safe_run_id
+    progress_path = run_dir / "progress.json"
+    report_path = run_dir / "report.json"
+    payload: dict[str, Any] = {
+        "run_id": safe_run_id,
+        "artifact_dir": str(run_dir),
+        "progress_exists": progress_path.exists(),
+        "report_exists": report_path.exists(),
+    }
+    if progress_path.exists():
+        payload["progress"] = _safe_monitor_progress(
+            json.loads(progress_path.read_text(encoding="utf-8"))
+        )
+    progress_dir = run_dir / "progress"
+    if progress_dir.exists():
+        phases = {}
+        for path in sorted(progress_dir.glob("*.json")):
+            if path.name.endswith(".worker.json") or path.name.endswith(".result.json"):
+                continue
+            try:
+                phases[path.stem] = _safe_monitor_progress(
+                    {"phases": {path.stem: json.loads(path.read_text(encoding="utf-8"))}}
+                )["phases"][path.stem]
+            except (json.JSONDecodeError, KeyError):
+                continue
+        if phases:
+            payload["phase_progress"] = phases
+    if report_path.exists():
+        payload["report"] = _safe_monitor_report(
+            json.loads(report_path.read_text(encoding="utf-8"))
+        )
+    return payload
+
+
 def _write_run_progress(run_dir: Path, payload: dict[str, Any], *, commit: bool = False) -> None:
     _ensure_dir(run_dir)
     _write_json(_run_progress_path(run_dir), payload)
@@ -484,10 +686,20 @@ def _normalize_dataset_config(value: DatasetConfig | dict[str, Any]) -> DatasetC
 
 def _parse_metadata_filters(raw_value: str) -> dict[str, str]:
     filters: dict[str, str] = {}
-    for chunk in raw_value.split(","):
-        item = chunk.strip()
-        if not item:
+    chunks: list[str] = []
+    for raw_chunk in raw_value.split(","):
+        chunk = raw_chunk.strip()
+        if not chunk:
             continue
+        if "=" in chunk or not chunks:
+            chunks.append(chunk)
+        else:
+            # Some metadata values contain commas, for example the Common Voice
+            # accent label "India and South Asia (India, Pakistan, Sri Lanka)".
+            chunks[-1] = f"{chunks[-1]}, {chunk}"
+
+    for chunk in chunks:
+        item = chunk.strip()
         if "=" not in item:
             raise ValueError(
                 f"Invalid metadata filter '{item}'. Expected comma-separated key=value pairs."
@@ -517,6 +729,49 @@ def _parse_float_list(raw_value: str) -> list[float]:
     return values
 
 
+def _parse_adapter_merge_recipes(raw_value: str) -> list[AdapterMergeRecipe]:
+    recipes: list[AdapterMergeRecipe] = []
+    for raw_recipe in raw_value.split(","):
+        recipe_item = raw_recipe.strip()
+        if not recipe_item:
+            continue
+        if "=" not in recipe_item:
+            raise ValueError(
+                "Invalid merge recipe. Expected label=run_id:weight[:label][@adapter_dir]+..."
+            )
+        label, raw_sources = recipe_item.split("=", 1)
+        recipe_label = _sanitize_artifact_component(label)
+        sources: list[AdapterMergeSource] = []
+        for raw_source in raw_sources.split("+"):
+            source_item = raw_source.strip()
+            if not source_item:
+                continue
+            adapter_dir = ""
+            if "@" in source_item:
+                source_item, adapter_dir = source_item.split("@", 1)
+            parts = source_item.split(":")
+            if len(parts) not in {2, 3}:
+                raise ValueError(
+                    "Invalid merge source. Expected run_id:weight[:label] or run_id:weight[:label]@adapter_dir"
+                )
+            run_id, raw_weight = parts[0].strip(), parts[1].strip()
+            source_label = parts[2].strip() if len(parts) == 3 else run_id
+            sources.append(
+                AdapterMergeSource(
+                    run_id=run_id,
+                    weight=float(raw_weight),
+                    label=source_label,
+                    adapter_dir=adapter_dir.strip(),
+                )
+            )
+        if len(sources) < 2:
+            raise ValueError(f"Merge recipe '{recipe_label}' must include at least two sources")
+        recipes.append(AdapterMergeRecipe(label=recipe_label, sources=sources))
+    if not recipes:
+        raise ValueError("merge_recipes must include at least one recipe")
+    return recipes
+
+
 def _normalize_train_config(value: TrainConfig | dict[str, Any]) -> TrainConfig:
     if isinstance(value, TrainConfig):
         config = _apply_recipe_defaults(value)
@@ -529,6 +784,9 @@ def _normalize_train_config(value: TrainConfig | dict[str, Any]) -> TrainConfig:
         if payload.get("anchor_dataset") is not None:
             payload["anchor_dataset"] = _normalize_dataset_config(payload["anchor_dataset"])
         config = _apply_recipe_defaults(TrainConfig(**payload))
+
+    if config.gradient_checkpointing and config.lora_scope.strip().lower() == "encoder":
+        config = replace(config, gradient_checkpointing=False)
 
     if config.distributed_gpu_count > 1 and config.gradient_checkpointing:
         config = replace(
@@ -549,6 +807,31 @@ def _normalize_analysis_config(value: AnalysisConfig | dict[str, Any]) -> Analys
     payload["group_fields"] = list(payload.get("group_fields", []))
     payload["row_filters"] = dict(payload.get("row_filters", {}))
     return AnalysisConfig(**payload)
+
+
+def _normalize_saved_eval_analysis_config(
+    value: SavedEvalAnalysisConfig | dict[str, Any],
+) -> SavedEvalAnalysisConfig:
+    if isinstance(value, SavedEvalAnalysisConfig):
+        return value
+
+    payload = dict(value)
+    payload["eval_dataset"] = _normalize_dataset_config(payload["eval_dataset"])
+    payload["group_fields"] = list(payload.get("group_fields", []))
+    payload["row_filters"] = dict(payload.get("row_filters", {}))
+    return SavedEvalAnalysisConfig(**payload)
+
+
+def _normalize_adapter_dataset_eval_config(
+    value: AdapterDatasetEvalConfig | dict[str, Any],
+) -> AdapterDatasetEvalConfig:
+    if isinstance(value, AdapterDatasetEvalConfig):
+        return value
+
+    payload = dict(value)
+    payload["eval_dataset"] = _normalize_dataset_config(payload["eval_dataset"])
+    payload["group_fields"] = list(payload.get("group_fields", []))
+    return AdapterDatasetEvalConfig(**payload)
 
 
 def _normalize_svarah_inference_sweep_config(
@@ -576,6 +859,20 @@ def _normalize_hard_example_mining_config(
     payload["dataset"] = _normalize_dataset_config(payload["dataset"])
     payload["metadata_fields"] = list(payload.get("metadata_fields", []))
     return HardExampleMiningConfig(**payload)
+
+
+def _normalize_adapter_merge_config(value: AdapterMergeConfig | dict[str, Any]) -> AdapterMergeConfig:
+    if isinstance(value, AdapterMergeConfig):
+        return value
+
+    payload = dict(value)
+    recipes = []
+    for raw_recipe in payload.get("recipes", []):
+        recipe_payload = dict(raw_recipe)
+        recipe_payload["sources"] = [AdapterMergeSource(**dict(item)) for item in recipe_payload.get("sources", [])]
+        recipes.append(AdapterMergeRecipe(**recipe_payload))
+    payload["recipes"] = recipes
+    return AdapterMergeConfig(**payload)
 
 
 def _normalize_dataset_profile_config(value: DatasetProfileConfig | dict[str, Any]) -> DatasetProfileConfig:
@@ -618,6 +915,8 @@ def _normalize_training_manifest_config(
     payload = dict(value)
     payload["dataset"] = _normalize_dataset_config(payload["dataset"])
     payload["metadata_fields"] = list(payload.get("metadata_fields", []))
+    payload["balance_fields"] = list(payload.get("balance_fields", []))
+    payload["exclude_manifest_paths"] = list(payload.get("exclude_manifest_paths", []))
     payload.setdefault("selection_strategy", "score")
     return TrainingManifestConfig(**payload)
 
@@ -715,9 +1014,12 @@ def _infer_text_column(features: Any) -> str:
     candidates = (
         "sentence",
         "transcript",
+        "Transcript",
         "transcription",
         "text",
         "normalized_text",
+        "Normalised_Transcript",
+        "Normalized_Transcript",
         "raw_text",
     )
     for candidate in candidates:
@@ -752,6 +1054,22 @@ def _finalize_loaded_dataset(dataset, *, config: DatasetConfig):
 
     audio_column = config.audio_column or _infer_audio_column(dataset.features)
     text_column = config.text_column or _infer_text_column(dataset.features)
+    if audio_column not in dataset.features:
+        inferred_audio_column = _infer_audio_column(dataset.features)
+        print(
+            f"[dataset] requested audio column {audio_column!r} is missing; "
+            f"using inferred column {inferred_audio_column!r}",
+            flush=True,
+        )
+        audio_column = inferred_audio_column
+    if text_column not in dataset.features:
+        inferred_text_column = _infer_text_column(dataset.features)
+        print(
+            f"[dataset] requested text column {text_column!r} is missing; "
+            f"using inferred column {inferred_text_column!r}",
+            flush=True,
+        )
+        text_column = inferred_text_column
     if config.metadata_filters:
         dataset = _filter_dataset_metadata(dataset, metadata_filters=config.metadata_filters)
     if config.require_text:
@@ -930,9 +1248,25 @@ def _normalized_filter_value(value: Any) -> str:
     return str(value).strip().lower()
 
 
+def _dataset_without_audio_columns(dataset):
+    from datasets import Audio
+
+    audio_columns = [
+        column_name
+        for column_name, feature in dataset.features.items()
+        if isinstance(feature, Audio)
+    ]
+    if not audio_columns:
+        return dataset
+    return dataset.remove_columns(audio_columns)
+
+
 def _filter_dataset_require_text(dataset, *, text_column: str):
+    metadata_dataset = _dataset_without_audio_columns(dataset)
     selected_indexes = [
-        index for index in range(len(dataset)) if str(dataset[index][text_column] or "").strip()
+        index
+        for index in range(len(metadata_dataset))
+        if str(metadata_dataset[index][text_column] or "").strip()
     ]
     if len(selected_indexes) == len(dataset):
         return dataset
@@ -946,9 +1280,10 @@ def _filter_dataset_metadata(dataset, *, metadata_filters: dict[str, str]):
     normalized_filters = {
         key: _normalized_filter_value(value) for key, value in metadata_filters.items()
     }
+    metadata_dataset = _dataset_without_audio_columns(dataset)
     selected_indexes = []
-    for index in range(len(dataset)):
-        row = dataset[index]
+    for index in range(len(metadata_dataset)):
+        row = metadata_dataset[index]
         if all(
             _normalized_filter_value(row.get(field_name)) == expected_value
             for field_name, expected_value in normalized_filters.items()
@@ -961,10 +1296,11 @@ def _filter_dataset_metadata(dataset, *, metadata_filters: dict[str, str]):
 
 
 def _filter_dataset_max_word_count(dataset, *, text_column: str, max_word_count: int):
+    metadata_dataset = _dataset_without_audio_columns(dataset)
     selected_indexes = [
         index
-        for index in range(len(dataset))
-        if _word_count(str(dataset[index][text_column])) <= max_word_count
+        for index in range(len(metadata_dataset))
+        if _word_count(str(metadata_dataset[index][text_column])) <= max_word_count
     ]
     if len(selected_indexes) == len(dataset):
         return dataset
@@ -1084,9 +1420,13 @@ def _filter_dataset_duration(
     min_duration_seconds: float | None,
     max_duration_seconds: float | None,
 ):
+    metadata_dataset = _dataset_without_audio_columns(dataset)
     selected_indexes = []
-    for index in range(len(dataset)):
-        duration_seconds = _row_duration_seconds(dataset[index], audio_column=audio_column)
+    for index in range(len(metadata_dataset)):
+        metadata_row = metadata_dataset[index]
+        duration_seconds = _row_duration_seconds(metadata_row, audio_column=audio_column)
+        if duration_seconds is None and metadata_dataset is not dataset:
+            duration_seconds = _row_duration_seconds(dataset[index], audio_column=audio_column)
         if duration_seconds is None:
             continue
         if min_duration_seconds is not None and duration_seconds < min_duration_seconds:
@@ -1194,7 +1534,9 @@ def _row_matches_dataset_config(
     if config.max_word_count is not None and _word_count(text) > config.max_word_count:
         return False, text, None
 
-    duration_seconds = _row_duration_seconds(row, audio_column=audio_column)
+    duration_seconds = None
+    if config.min_duration_seconds is not None or config.max_duration_seconds is not None:
+        duration_seconds = _row_duration_seconds(row, audio_column=audio_column)
     if config.min_duration_seconds is not None:
         if duration_seconds is None or duration_seconds < config.min_duration_seconds:
             return False, text, duration_seconds
@@ -1210,11 +1552,29 @@ def _survey_single_dataset_config(
     base_config: DatasetConfig,
     config_name: str,
     token: str | None,
+    max_rows_per_config: int | None,
     sample_transcripts_per_config: int,
 ) -> dict[str, Any]:
     config = replace(base_config, config=config_name)
     try:
-        dataset, audio_column, text_column = _load_dataset_streaming_split(config, token=token)
+        if max_rows_per_config is not None:
+            from datasets import load_dataset
+
+            split_name = config.split or "train"
+            dataset = load_dataset(
+                config.name,
+                config.config,
+                split=f"{split_name}[:{max_rows_per_config}]",
+                token=token,
+                trust_remote_code=config.trust_remote_code,
+            )
+            audio_column = config.audio_column or _infer_audio_column(dataset.features)
+            text_column = config.text_column or _infer_text_column(dataset.features)
+            metadata_dataset = _dataset_without_audio_columns(dataset)
+            row_iterable = (metadata_dataset[index] for index in range(len(metadata_dataset)))
+        else:
+            dataset, audio_column, text_column = _load_dataset_streaming_split(config, token=token)
+            row_iterable = iter(dataset)
         row_count = 0
         duration_sum_seconds = 0.0
         duration_count = 0
@@ -1224,8 +1584,10 @@ def _survey_single_dataset_config(
         gender_counts: dict[str, int] = {}
         state_value = "unknown"
         district_value = "unknown"
+        raw_rows_seen = 0
 
-        for row in dataset:
+        for row in row_iterable:
+            raw_rows_seen += 1
             matches, text, duration_seconds = _row_matches_dataset_config(
                 row,
                 config=config,
@@ -1238,6 +1600,8 @@ def _survey_single_dataset_config(
             row_count += 1
             cleaned_text = _strip_transcript_markup(text)
             word_sum += _word_count(cleaned_text)
+            if duration_seconds is None:
+                duration_seconds = _row_duration_seconds(row, audio_column=audio_column)
             if duration_seconds is not None:
                 duration_sum_seconds += duration_seconds
                 duration_count += 1
@@ -1257,11 +1621,15 @@ def _survey_single_dataset_config(
                 state_value = str(row.get("state") or "").strip() or "unknown"
             if district_value == "unknown":
                 district_value = str(row.get("district") or "").strip() or "unknown"
+            if max_rows_per_config is not None and raw_rows_seen >= max_rows_per_config:
+                break
 
         return {
             "config": config_name,
             "state": state_value,
             "district": district_value,
+            "raw_rows_scanned": raw_rows_seen,
+            "scan_truncated": bool(max_rows_per_config is not None and raw_rows_seen >= max_rows_per_config),
             "rows": row_count,
             "hours": duration_sum_seconds / 3600,
             "mean_duration_seconds": (duration_sum_seconds / duration_count) if duration_count else 0.0,
@@ -1310,6 +1678,7 @@ def _survey_dataset_configs_impl(config: DatasetConfigSurveyConfig) -> dict[str,
                 base_config=replace(config.dataset, config=None),
                 config_name=config_name,
                 token=token,
+                max_rows_per_config=config.max_rows_per_config,
                 sample_transcripts_per_config=config.sample_transcripts_per_config,
             ): config_name
             for config_name in config_names
@@ -1326,6 +1695,8 @@ def _survey_dataset_configs_impl(config: DatasetConfigSurveyConfig) -> dict[str,
         "config",
         "state",
         "district",
+        "raw_rows_scanned",
+        "scan_truncated",
         "rows",
         "hours",
         "mean_duration_seconds",
@@ -1341,6 +1712,8 @@ def _survey_dataset_configs_impl(config: DatasetConfigSurveyConfig) -> dict[str,
                 "config": item.get("config"),
                 "state": item.get("state"),
                 "district": item.get("district"),
+                "raw_rows_scanned": item.get("raw_rows_scanned"),
+                "scan_truncated": item.get("scan_truncated"),
                 "rows": item.get("rows"),
                 "hours": item.get("hours"),
                 "mean_duration_seconds": item.get("mean_duration_seconds"),
@@ -1376,6 +1749,7 @@ def _survey_dataset_configs_impl(config: DatasetConfigSurveyConfig) -> dict[str,
             "config_name_regex": config.config_name_regex,
             "config_names": config.config_names,
             "max_configs": config.max_configs,
+            "max_rows_per_config": config.max_rows_per_config,
             "config_count": len(config_names),
         },
         "summary": {
@@ -1526,11 +1900,57 @@ def _build_audit_manifest_impl(config: AuditConfig) -> dict[str, Any]:
     import soundfile as sf
     from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 
+    audit_run_id = f"{config.audit_name}-{_now_utc()}"
+    audit_dir = ARTIFACTS_DIR / audit_run_id
+    audio_dir = audit_dir / "audio"
+    _ensure_dir(audit_dir)
+    _write_run_progress(
+        audit_dir,
+        {
+            "stage": "build_audit_manifest",
+            "status": "loading_dataset",
+            "updated_at_utc": _now_iso(),
+            "dataset": {
+                "name": config.dataset.name,
+                "config": config.dataset.config,
+                "config_names": config.dataset.config_names,
+                "split": config.dataset.split,
+            },
+            "sample_limit": config.sample_limit,
+            "export_audio": config.export_audio,
+        },
+        commit=True,
+    )
+
     token = _get_hf_token()
     dataset, audio_column, text_column = _load_dataset_split(config.dataset, token=token)
     metadata_dataset = dataset.remove_columns([audio_column])
+    _write_run_progress(
+        audit_dir,
+        {
+            "stage": "build_audit_manifest",
+            "status": "materializing_metadata",
+            "updated_at_utc": _now_iso(),
+            "rows_loaded": len(dataset),
+            "audio_column": audio_column,
+            "text_column": text_column,
+        },
+        commit=True,
+    )
     metadata_rows = [metadata_dataset[index] for index in range(len(metadata_dataset))]
 
+    _write_run_progress(
+        audit_dir,
+        {
+            "stage": "build_audit_manifest",
+            "status": "selecting_rows",
+            "updated_at_utc": _now_iso(),
+            "rows_loaded": len(dataset),
+            "metadata_rows": len(metadata_rows),
+            "sample_limit": config.sample_limit,
+        },
+        commit=True,
+    )
     selected_indexes, stratify_field_used = _select_audit_indexes(
         metadata_rows,
         sample_limit=min(config.sample_limit, len(dataset)),
@@ -1539,12 +1959,22 @@ def _build_audit_manifest_impl(config: AuditConfig) -> dict[str, Any]:
         max_samples_per_group=config.max_samples_per_group,
     )
 
-    audit_run_id = f"{config.audit_name}-{_now_utc()}"
-    audit_dir = ARTIFACTS_DIR / audit_run_id
-    audio_dir = audit_dir / "audio"
-    _ensure_dir(audit_dir)
     if config.export_audio:
         _ensure_dir(audio_dir)
+    _write_run_progress(
+        audit_dir,
+        {
+            "stage": "build_audit_manifest",
+            "status": "exporting",
+            "updated_at_utc": _now_iso(),
+            "rows_loaded": len(dataset),
+            "selected_rows": len(selected_indexes),
+            "exported_rows": 0,
+            "export_audio": config.export_audio,
+            "stratify_field_used": stratify_field_used,
+        },
+        commit=True,
+    )
 
     transcript_normalizer = BasicTextNormalizer() if config.normalize_transcripts else None
     metadata_fields = config.metadata_fields or _default_audit_metadata_fields(metadata_dataset.column_names)
@@ -1601,6 +2031,25 @@ def _build_audit_manifest_impl(config: AuditConfig) -> dict[str, Any]:
         for field_name in metadata_fields:
             manifest_row[field_name] = row.get(field_name)
         manifest_rows.append(manifest_row)
+        if audit_index == 1 or audit_index % 25 == 0 or audit_index == len(selected_indexes):
+            print(
+                f"[audit:{audit_run_id}] exported {audit_index}/{len(selected_indexes)} "
+                f"export_audio={config.export_audio}"
+            )
+            _write_run_progress(
+                audit_dir,
+                {
+                    "stage": "build_audit_manifest",
+                    "status": "exporting",
+                    "updated_at_utc": _now_iso(),
+                    "rows_loaded": len(dataset),
+                    "selected_rows": len(selected_indexes),
+                    "exported_rows": audit_index,
+                    "export_audio": config.export_audio,
+                    "stratify_field_used": stratify_field_used,
+                },
+                commit=True,
+            )
 
     manifest_columns = list(manifest_rows[0].keys()) if manifest_rows else [
         "audit_index",
@@ -1661,6 +2110,20 @@ def _build_audit_manifest_impl(config: AuditConfig) -> dict[str, Any]:
         },
     }
     _write_json(audit_dir / "report.json", report)
+    _write_run_progress(
+        audit_dir,
+        {
+            "stage": "build_audit_manifest",
+            "status": "complete",
+            "updated_at_utc": _now_iso(),
+            "rows_loaded": len(dataset),
+            "selected_rows": len(manifest_rows),
+            "exported_rows": len(manifest_rows),
+            "export_audio": config.export_audio,
+            "report_path": str(audit_dir / "report.json"),
+        },
+        commit=True,
+    )
     artifacts_volume.commit()
     hf_cache_volume.commit()
     return report
@@ -1796,6 +2259,118 @@ def _select_manifest_candidates_bucketed_transfer(
     return selected, speaker_counts
 
 
+def _select_manifest_candidates_metadata_balanced(
+    candidates: list[dict[str, Any]],
+    *,
+    output_limit: int,
+    max_samples_per_speaker: int,
+    rejection_counts: dict[str, int],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    grouped_candidates: dict[str, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        grouped_candidates.setdefault(str(candidate["balance_key"]), []).append(candidate)
+
+    active_keys = sorted(
+        grouped_candidates,
+        key=lambda key: (
+            -float(grouped_candidates[key][0]["score_payload"]["score"]),
+            key,
+        ),
+    )
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[int] = set()
+    speaker_counts: dict[str, int] = {}
+
+    def try_add(candidate: dict[str, Any]) -> bool:
+        candidate_id = int(candidate["dataset_index"])
+        if candidate_id in selected_ids:
+            return False
+        speaker_key = str(candidate["speaker_key"])
+        if max_samples_per_speaker > 0 and speaker_counts.get(speaker_key, 0) >= max_samples_per_speaker:
+            rejection_counts["speaker_cap"] = rejection_counts.get("speaker_cap", 0) + 1
+            return False
+        selected.append(candidate)
+        selected_ids.add(candidate_id)
+        speaker_counts[speaker_key] = speaker_counts.get(speaker_key, 0) + 1
+        return True
+
+    while active_keys and len(selected) < output_limit:
+        next_active_keys: list[str] = []
+        for key in active_keys:
+            bucket = grouped_candidates[key]
+            added_from_bucket = False
+            while bucket:
+                candidate = bucket.pop(0)
+                if try_add(candidate):
+                    added_from_bucket = True
+                    break
+            if bucket:
+                next_active_keys.append(key)
+            if len(selected) >= output_limit:
+                break
+        active_keys = next_active_keys
+
+    return selected, speaker_counts
+
+
+def _manifest_balance_key(row: dict[str, Any], balance_fields: list[str]) -> str:
+    parts = []
+    for field_name in balance_fields:
+        value = str(row.get(field_name) or "").strip()
+        if value:
+            parts.append(f"{field_name}={value}")
+    return "|".join(parts) if parts else "all"
+
+
+def _manifest_text_key(text: Any) -> str:
+    cleaned = _strip_transcript_markup(str(text or "")).lower()
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _resolve_manifest_artifact_path(path_value: str) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return ARTIFACTS_DIR / path_value.lstrip("/")
+
+
+def _load_manifest_exclusion_sets(paths: list[str]) -> dict[str, set[str]]:
+    excluded_texts: set[str] = set()
+    excluded_speakers: set[str] = set()
+    excluded_source_rows: set[str] = set()
+    for raw_path in paths:
+        if not raw_path.strip():
+            continue
+        path = _resolve_manifest_artifact_path(raw_path.strip())
+        if not path.exists():
+            raise FileNotFoundError(f"Exclude manifest not found: {path}")
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                text_key = _manifest_text_key(
+                    row.get("text")
+                    or row.get("sentence")
+                    or row.get("transcript")
+                    or row.get("raw_transcript")
+                )
+                if text_key:
+                    excluded_texts.add(text_key)
+                speaker_key = _speaker_key(row)
+                if speaker_key != "unknown":
+                    excluded_speakers.add(speaker_key)
+                dataset_name = str(row.get("source_dataset") or "").strip()
+                dataset_index = row.get("dataset_index")
+                if dataset_name and dataset_index is not None:
+                    excluded_source_rows.add(f"{dataset_name}|{dataset_index}")
+    return {
+        "texts": excluded_texts,
+        "speakers": excluded_speakers,
+        "source_rows": excluded_source_rows,
+    }
+
+
 def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, Any]:
     import soundfile as sf
     from transformers.models.whisper.english_normalizer import BasicTextNormalizer
@@ -1836,6 +2411,14 @@ def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, A
     transcript_normalizer = BasicTextNormalizer() if config.normalize_transcripts else None
     metadata_dataset = dataset.remove_columns([audio_column])
     metadata_fields = config.metadata_fields or _default_audit_metadata_fields(metadata_dataset.column_names)
+    exclusion_sets = _load_manifest_exclusion_sets(config.exclude_manifest_paths)
+    if config.exclude_manifest_paths:
+        print(
+            f"[manifest:{manifest_run_id}] exclusion_sets "
+            f"texts={len(exclusion_sets['texts'])} "
+            f"speakers={len(exclusion_sets['speakers'])} "
+            f"source_rows={len(exclusion_sets['source_rows'])}"
+        )
 
     rng = random.Random(config.seed)
     candidates = []
@@ -1845,8 +2428,11 @@ def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, A
 
     for dataset_index in range(len(dataset)):
         row = metadata_dataset[dataset_index]
+        score_row = row
+        if config.dataset.min_duration_seconds is not None or config.dataset.max_duration_seconds is not None:
+            score_row = dataset[dataset_index]
         score_payload = _score_training_row(
-            row,
+            score_row,
             text_column=text_column,
             audio_column=audio_column,
             quality_preset=config.quality_preset,
@@ -1880,10 +2466,25 @@ def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, A
             )
         if score_payload["reject"]:
             continue
+        speaker_key = _speaker_key(row)
+        if speaker_key == "unknown":
+            speaker_key = f"unknown-row-{dataset_index}"
+        text_key = _manifest_text_key(row.get(text_column))
+        source_row_key = f"{config.dataset.name}|{dataset_index}"
+        if text_key and text_key in exclusion_sets["texts"]:
+            rejection_counts["excluded_text"] = rejection_counts.get("excluded_text", 0) + 1
+            continue
+        if speaker_key in exclusion_sets["speakers"]:
+            rejection_counts["excluded_speaker"] = rejection_counts.get("excluded_speaker", 0) + 1
+            continue
+        if source_row_key in exclusion_sets["source_rows"]:
+            rejection_counts["excluded_source_row"] = rejection_counts.get("excluded_source_row", 0) + 1
+            continue
         candidates.append(
             {
                 "dataset_index": dataset_index,
-                "speaker_key": _speaker_key(row),
+                "speaker_key": speaker_key,
+                "balance_key": _manifest_balance_key(row, config.balance_fields),
                 "score_payload": score_payload,
                 "tie_breaker": rng.random(),
             }
@@ -1906,8 +2507,17 @@ def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, A
             max_samples_per_speaker=config.max_samples_per_speaker,
             rejection_counts=rejection_counts,
         )
+    elif selection_strategy == "metadata_balanced":
+        selected, speaker_counts = _select_manifest_candidates_metadata_balanced(
+            candidates,
+            output_limit=config.output_limit,
+            max_samples_per_speaker=config.max_samples_per_speaker,
+            rejection_counts=rejection_counts,
+        )
     else:
-        raise ValueError("Unsupported manifest selection_strategy. Expected one of: score, bucketed_transfer")
+        raise ValueError(
+            "Unsupported manifest selection_strategy. Expected one of: score, bucketed_transfer, metadata_balanced"
+        )
     _write_run_progress(
         manifest_dir,
         {
@@ -1922,6 +2532,7 @@ def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, A
             "output_limit": config.output_limit,
             "export_audio": config.export_audio,
             "selection_strategy": selection_strategy,
+            "balance_fields": config.balance_fields,
         },
         commit=True,
     )
@@ -1975,6 +2586,7 @@ def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, A
             "source_config": config.dataset.config,
             "source_split": config.dataset.split,
             "speaker_key": candidate["speaker_key"],
+            "balance_key": candidate["balance_key"],
             "audio_file": audio_relative_path,
         }
         for field_name in metadata_fields:
@@ -2053,6 +2665,13 @@ def _build_training_manifest_impl(config: TrainingManifestConfig) -> dict[str, A
             "candidate_rows": len(candidates),
             "quality_preset": config.quality_preset,
             "selection_strategy": selection_strategy,
+            "balance_fields": config.balance_fields,
+            "exclude_manifest_paths": config.exclude_manifest_paths,
+            "exclude_counts": {
+                "texts": len(exclusion_sets["texts"]),
+                "speakers": len(exclusion_sets["speakers"]),
+                "source_rows": len(exclusion_sets["source_rows"]),
+            },
             "max_samples_per_speaker": config.max_samples_per_speaker,
             "unique_speakers": len(speaker_counts),
             "score_distribution_all_loaded": _summarize_numeric_values(score_values),
@@ -2403,7 +3022,10 @@ def _build_lora_model(model_name: str, config: TrainConfig):
             if param.requires_grad and "lora_" in name and ".encoder." not in name:
                 param.requires_grad = False
     if config.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
     return model
 
@@ -2783,35 +3405,42 @@ def _build_seq2seq_training_arguments(
     import torch
     from transformers import Seq2SeqTrainingArguments
 
-    return Seq2SeqTrainingArguments(
-        output_dir=str(output_dir),
-        per_device_train_batch_size=config.per_device_train_batch_size,
-        per_device_eval_batch_size=config.per_device_eval_batch_size,
-        gradient_accumulation_steps=_effective_gradient_accumulation_steps(config),
-        eval_accumulation_steps=config.eval_accumulation_steps,
-        learning_rate=config.learning_rate,
-        warmup_steps=config.warmup_steps,
-        lr_scheduler_type=config.lr_scheduler_type,
-        num_train_epochs=config.num_train_epochs,
-        logging_steps=config.logging_steps,
-        evaluation_strategy="no",
-        save_strategy="no",
-        save_total_limit=config.save_total_limit,
-        predict_with_generate=False,
-        generation_max_length=config.max_new_tokens,
-        remove_unused_columns=False,
-        label_names=["labels"],
-        bf16=torch.cuda.is_available(),
-        gradient_checkpointing=config.gradient_checkpointing,
-        report_to=[],
-        load_best_model_at_end=False,
-        seed=config.seed,
-        dataloader_num_workers=_effective_dataloader_num_workers(config),
-        dataloader_pin_memory=True,
-        ddp_find_unused_parameters=config.ddp_find_unused_parameters if config.distributed_gpu_count > 1 else None,
-        optim=config.optim,
-        local_rank=local_rank,
-    )
+    training_kwargs = {
+        "output_dir": str(output_dir),
+        "per_device_train_batch_size": config.per_device_train_batch_size,
+        "per_device_eval_batch_size": config.per_device_eval_batch_size,
+        "gradient_accumulation_steps": _effective_gradient_accumulation_steps(config),
+        "eval_accumulation_steps": config.eval_accumulation_steps,
+        "learning_rate": config.learning_rate,
+        "warmup_steps": config.warmup_steps,
+        "lr_scheduler_type": config.lr_scheduler_type,
+        "num_train_epochs": config.num_train_epochs,
+        "logging_steps": config.logging_steps,
+        "evaluation_strategy": "no",
+        "save_strategy": "no",
+        "save_total_limit": config.save_total_limit,
+        "predict_with_generate": False,
+        "generation_max_length": config.max_new_tokens,
+        "remove_unused_columns": False,
+        "label_names": ["labels"],
+        "bf16": torch.cuda.is_available(),
+        "gradient_checkpointing": config.gradient_checkpointing,
+        "report_to": [],
+        "load_best_model_at_end": False,
+        "seed": config.seed,
+        "dataloader_num_workers": _effective_dataloader_num_workers(config),
+        "dataloader_pin_memory": True,
+        "ddp_find_unused_parameters": config.ddp_find_unused_parameters if config.distributed_gpu_count > 1 else None,
+        "optim": config.optim,
+        "local_rank": local_rank,
+    }
+    if config.gradient_checkpointing:
+        import inspect
+
+        if "gradient_checkpointing_kwargs" in inspect.signature(Seq2SeqTrainingArguments.__init__).parameters:
+            training_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+
+    return Seq2SeqTrainingArguments(**training_kwargs)
 
 
 class _VolumeProgressCallback:
@@ -2967,7 +3596,7 @@ def _evaluate_model(
 ) -> dict[str, Any]:
     import evaluate
 
-    prediction_payload = _predict_text_dataset(
+    prediction_payload = _predict_dataset(
         model=model,
         processor=processor,
         dataset=dataset,
@@ -3126,7 +3755,7 @@ def _predict_dataset(
     progress_log_interval_batches: int = 25,
 ) -> dict[str, Any]:
     metadata_dataset = dataset.remove_columns([audio_column])
-    metadata_rows = [metadata_dataset[index] for index in range(len(metadata_dataset))]
+    metadata_rows = [_sanitize_metadata_row(metadata_dataset[index]) for index in range(len(metadata_dataset))]
     prediction_payload = _predict_text_dataset(
         model=model,
         processor=processor,
@@ -3146,6 +3775,19 @@ def _predict_dataset(
     return prediction_payload
 
 
+def _sanitize_metadata_row(row: dict[str, Any]) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for key, value in dict(row).items():
+        if isinstance(value, (list, tuple)):
+            if len(value) > 16:
+                sanitized[key] = f"<{type(value).__name__}:len={len(value)}>"
+            else:
+                sanitized[key] = list(value)
+            continue
+        sanitized[key] = value
+    return sanitized
+
+
 def _duration_bucket(duration_seconds: float) -> str:
     if duration_seconds < 3:
         return "<3s"
@@ -3157,9 +3799,17 @@ def _duration_bucket(duration_seconds: float) -> str:
 
 
 def _group_value(row: dict[str, Any], field_name: str) -> str:
-    raw_text = str(row.get("text") or "")
+    raw_text = str(
+        row.get("text")
+        or row.get("sentence")
+        or row.get("transcript")
+        or row.get("raw_transcript")
+        or ""
+    )
     if field_name == "duration_bucket":
-        duration = float(row.get("duration") or 0.0)
+        duration = float(row.get("duration") or row.get("duration_seconds") or row.get("duration_ms") or 0.0)
+        if row.get("duration_ms") is not None and row.get("duration") is None and row.get("duration_seconds") is None:
+            duration = duration / 1000.0
         return _duration_bucket(duration)
     if field_name == "word_count_bucket":
         return _word_count_bucket(raw_text)
@@ -3266,13 +3916,17 @@ def _score_training_row(
     quality_preset: str,
 ) -> dict[str, Any]:
     text = str(row.get(text_column) or "")
-    flags = _text_quality_flags(text)
+    raw_flags = _text_quality_flags(text)
+    flags = _text_quality_flags(_strip_transcript_markup(text))
+    flags["contains_markup"] = raw_flags["contains_markup"]
     duration_seconds = _row_duration_seconds(row, audio_column=audio_column)
     up_votes = _safe_int(row.get("up_votes"))
     down_votes = _safe_int(row.get("down_votes"))
     accent = str(row.get("accents") or row.get("accent") or "")
     language = str(row.get("language") or row.get("locale") or row.get("lang") or "")
     preset = quality_preset.strip().lower()
+    accent_required = preset in {"accent_safe", "accent_only"}
+    reject_format_sensitive = preset == "accent_only"
 
     score = 100.0
     reject_reasons: list[str] = []
@@ -3311,6 +3965,8 @@ def _score_training_row(
     if flags["contains_digit"] or flags["contains_date_like"] or flags["contains_currency_or_amount"]:
         score -= 12
         warnings.append("format_sensitive_text")
+        if reject_format_sensitive:
+            reject_reasons.append("format_sensitive_text")
 
     if up_votes is not None:
         if up_votes >= 3:
@@ -3327,15 +3983,15 @@ def _score_training_row(
     if accent:
         if "india" in accent.lower() or "south asia" in accent.lower():
             score += 12
-        elif preset == "accent_safe":
+        elif accent_required:
             reject_reasons.append("non_indian_accent")
-    elif preset == "accent_safe":
+    elif accent_required:
         score -= 8
         warnings.append("missing_accent_metadata")
 
     if language:
         normalized_language = language.strip().lower()
-        if normalized_language not in {"en", "eng", "english"} and preset == "accent_safe":
+        if normalized_language not in {"en", "eng", "english"} and accent_required:
             reject_reasons.append("non_english_language")
 
     return {
@@ -3850,6 +4506,8 @@ def _profile_train_selection_impl(config: TrainConfig) -> dict[str, Any]:
 
 
 def _verify_audio_manifest_impl(config: AudioManifestVerifyConfig) -> dict[str, Any]:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     import soundfile as sf
 
     manifest_path = Path(config.dataset.name)
@@ -3895,6 +4553,7 @@ def _verify_audio_manifest_impl(config: AudioManifestVerifyConfig) -> dict[str, 
             "total_rows": len(rows),
             "checked_rows": 0,
             "failures": 0,
+            "max_workers": config.max_workers,
         },
         commit=True,
     )
@@ -3906,60 +4565,84 @@ def _verify_audio_manifest_impl(config: AudioManifestVerifyConfig) -> dict[str, 
     bytes_values: list[float] = []
     started_at = datetime.now(tz=UTC)
 
-    for index, row in enumerate(rows, start=1):
+    def check_row(index: int, row: dict[str, Any]) -> dict[str, Any]:
         raw_audio_path = str(row.get(audio_column) or "").strip()
         if not raw_audio_path:
-            failures.append(
-                {
+            return {
+                "ok": False,
+                "failure": {
                     "row": index,
                     "reason": "missing_audio_path",
                     "text": str(row.get(text_column) or "")[:200],
-                }
-            )
-            continue
+                },
+            }
         audio_path = Path(raw_audio_path)
         if not audio_path.is_absolute():
             audio_path = ARTIFACTS_DIR / raw_audio_path.lstrip("/")
         try:
             info = sf.info(str(audio_path))
             duration = float(info.frames) / float(info.samplerate) if info.samplerate else 0.0
-            duration_values.append(duration)
-            sample_rate_key = str(info.samplerate)
-            sample_rate_counts[sample_rate_key] = sample_rate_counts.get(sample_rate_key, 0) + 1
-            channels_key = str(info.channels)
-            channels_counts[channels_key] = channels_counts.get(channels_key, 0) + 1
-            if audio_path.exists():
-                bytes_values.append(float(audio_path.stat().st_size))
+            return {
+                "ok": True,
+                "duration": duration,
+                "sample_rate": str(info.samplerate),
+                "channels": str(info.channels),
+                "file_bytes": float(audio_path.stat().st_size) if audio_path.exists() else None,
+            }
         except Exception as exc:
-            failures.append(
-                {
+            return {
+                "ok": False,
+                "failure": {
                     "row": index,
                     "audio": str(audio_path),
                     "reason": type(exc).__name__,
                     "message": str(exc)[:500],
                     "text": str(row.get(text_column) or "")[:200],
-                }
-            )
-
-        if index == 1 or index % 100 == 0 or index == len(rows):
-            elapsed = max(0.001, (datetime.now(tz=UTC) - started_at).total_seconds())
-            print(
-                f"[verify-audio:{verify_run_id}] checked {index}/{len(rows)} "
-                f"failures={len(failures)} rows_per_second={index / elapsed:.2f}"
-            )
-            _write_run_progress(
-                verify_dir,
-                {
-                    "stage": "verify_audio_manifest",
-                    "status": "checking",
-                    "updated_at_utc": _now_iso(),
-                    "checked_rows": index,
-                    "total_rows": len(rows),
-                    "failures": len(failures),
-                    "rows_per_second": index / elapsed,
                 },
-                commit=True,
-            )
+            }
+
+    checked_rows = 0
+    max_workers = max(1, int(config.max_workers or 1))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(check_row, index, row)
+            for index, row in enumerate(rows, start=1)
+        ]
+        for future in as_completed(futures):
+            result = future.result()
+            checked_rows += 1
+            if result["ok"]:
+                duration_values.append(float(result["duration"]))
+                sample_rate_key = str(result["sample_rate"])
+                sample_rate_counts[sample_rate_key] = sample_rate_counts.get(sample_rate_key, 0) + 1
+                channels_key = str(result["channels"])
+                channels_counts[channels_key] = channels_counts.get(channels_key, 0) + 1
+                if result["file_bytes"] is not None:
+                    bytes_values.append(float(result["file_bytes"]))
+            else:
+                failures.append(result["failure"])
+
+            if checked_rows == 1 or checked_rows % 500 == 0 or checked_rows == len(rows):
+                elapsed = max(0.001, (datetime.now(tz=UTC) - started_at).total_seconds())
+                print(
+                    f"[verify-audio:{verify_run_id}] checked {checked_rows}/{len(rows)} "
+                    f"failures={len(failures)} rows_per_second={checked_rows / elapsed:.2f} "
+                    f"workers={max_workers}"
+                )
+                _write_run_progress(
+                    verify_dir,
+                    {
+                        "stage": "verify_audio_manifest",
+                        "status": "checking",
+                        "updated_at_utc": _now_iso(),
+                        "checked_rows": checked_rows,
+                        "total_rows": len(rows),
+                        "failures": len(failures),
+                        "rows_per_second": checked_rows / elapsed,
+                        "max_workers": max_workers,
+                    },
+                    commit=True,
+                )
 
     report = {
         "verify_run_id": verify_run_id,
@@ -3972,6 +4655,7 @@ def _verify_audio_manifest_impl(config: AudioManifestVerifyConfig) -> dict[str, 
             "rows_checked": len(rows),
             "sample_limit": config.sample_limit,
             "seed": config.seed,
+            "max_workers": max_workers,
         },
         "audio": {
             "valid_rows": len(rows) - len(failures),
@@ -4349,6 +5033,363 @@ def _analyze_svarah_impl(config: AnalysisConfig) -> dict[str, Any]:
     return report
 
 
+def _load_metadata_rows_for_saved_eval(
+    *,
+    config: SavedEvalAnalysisConfig,
+    expected_rows: int,
+    raw_references: list[str],
+) -> tuple[list[dict[str, Any]], str, str, list[str]]:
+    token = _get_hf_token()
+    dataset, audio_column, text_column = _load_dataset_split(config.eval_dataset, token=token)
+    warnings: list[str] = []
+    if len(dataset) < expected_rows:
+        raise ValueError(
+            f"Eval dataset has {len(dataset)} rows but saved predictions have {expected_rows} rows"
+        )
+    if len(dataset) > expected_rows:
+        warnings.append(
+            f"Eval dataset has {len(dataset)} rows; using the first {expected_rows} rows to match saved predictions"
+        )
+        dataset = _slice_dataset_rows(dataset, start=0, stop=expected_rows)
+
+    metadata_dataset = dataset.remove_columns([audio_column])
+    metadata_rows = [dict(metadata_dataset[index]) for index in range(len(metadata_dataset))]
+    for index, row in enumerate(metadata_rows):
+        if not str(row.get("text") or "").strip():
+            row["text"] = raw_references[index] if index < len(raw_references) else ""
+        if text_column != "text" and text_column in row:
+            row.setdefault("source_text_column", text_column)
+    return metadata_rows, audio_column, text_column, warnings
+
+
+def _analyze_saved_eval_run_impl(config: SavedEvalAnalysisConfig) -> dict[str, Any]:
+    if not config.source_run_id:
+        raise ValueError("source_run_id is required for saved eval analysis")
+
+    source_dir = ARTIFACTS_DIR / config.source_run_id
+    progress_dir = _run_progress_dir(source_dir)
+    base_result_path = progress_dir / "svarah-base.result.json"
+    adapter_result_path = progress_dir / "svarah-adapter.result.json"
+    if not base_result_path.exists():
+        raise FileNotFoundError(f"Missing saved base predictions: {base_result_path}")
+    if not adapter_result_path.exists():
+        raise FileNotFoundError(f"Missing saved adapter predictions: {adapter_result_path}")
+
+    base_payload = json.loads(base_result_path.read_text(encoding="utf-8"))
+    adapter_payload = json.loads(adapter_result_path.read_text(encoding="utf-8"))
+    expected_rows = len(base_payload["references"])
+    if len(adapter_payload["references"]) != expected_rows:
+        raise ValueError(
+            f"Base predictions have {expected_rows} rows but adapter predictions have "
+            f"{len(adapter_payload['references'])} rows"
+        )
+
+    metadata_warnings: list[str] = []
+    if len(base_payload.get("metadata_rows", [])) == expected_rows:
+        metadata_rows = [dict(row) for row in base_payload["metadata_rows"]]
+        audio_column = str(config.eval_dataset.audio_column or "audio")
+        text_column = str(config.eval_dataset.text_column or "text")
+        metadata_source = "saved_prediction_payload"
+    else:
+        metadata_rows, audio_column, text_column, metadata_warnings = _load_metadata_rows_for_saved_eval(
+            config=config,
+            expected_rows=expected_rows,
+            raw_references=base_payload["references"],
+        )
+        metadata_source = "eval_dataset_reload"
+
+    for index, row in enumerate(metadata_rows):
+        if not str(row.get("text") or "").strip():
+            row["text"] = base_payload["references"][index]
+
+    selected_indexes = _filter_analysis_indexes(metadata_rows, config.row_filters)
+    filtered_metadata_rows = _select_rows(metadata_rows, selected_indexes)
+    filtered_raw_references = _select_rows(base_payload["references"], selected_indexes)
+    filtered_normalized_references = _select_rows(
+        base_payload["normalized_references"], selected_indexes
+    )
+    raw_predictions_by_model = {
+        "base": _select_rows(base_payload["predictions"], selected_indexes),
+        config.adapter_label: _select_rows(adapter_payload["predictions"], selected_indexes),
+    }
+    normalized_predictions_by_model = {
+        "base": _select_rows(base_payload["normalized_predictions"], selected_indexes),
+        config.adapter_label: _select_rows(
+            adapter_payload["normalized_predictions"], selected_indexes
+        ),
+    }
+    overall_metrics = {
+        label: _compute_text_metrics(filtered_normalized_references, predictions)
+        for label, predictions in normalized_predictions_by_model.items()
+    }
+
+    analysis_run_id = f"{config.analysis_name}-{_now_utc()}"
+    analysis_dir = ARTIFACTS_DIR / analysis_run_id
+    _ensure_dir(analysis_dir)
+    pairwise_predictions_path = analysis_dir / "pairwise_predictions.jsonl"
+    _write_pairwise_prediction_rows(
+        output_path=pairwise_predictions_path,
+        metadata_rows=filtered_metadata_rows,
+        raw_references=filtered_raw_references,
+        raw_predictions_by_model=raw_predictions_by_model,
+        normalized_references=filtered_normalized_references,
+        normalized_predictions_by_model=normalized_predictions_by_model,
+    )
+
+    base_metrics = overall_metrics["base"]
+    adapter_metrics = overall_metrics[config.adapter_label]
+    report = {
+        "created_at_utc": datetime.now(tz=UTC).isoformat(),
+        "analysis_run_id": analysis_run_id,
+        "source_run_id": config.source_run_id,
+        "runtime": {
+            "mode": "saved_eval_analysis",
+            "metadata_source": metadata_source,
+            "metadata_warnings": metadata_warnings,
+        },
+        "dataset": {
+            "name": config.eval_dataset.name,
+            "config": config.eval_dataset.config,
+            "split": config.eval_dataset.split,
+            "audio_column": audio_column,
+            "text_column": text_column,
+            "samples": expected_rows,
+            "filtered_samples": len(selected_indexes),
+        },
+        "row_filters": config.row_filters,
+        "overall_metrics": overall_metrics,
+        "deltas_vs_base": {
+            config.adapter_label: {
+                "wer": adapter_metrics["wer"] - base_metrics["wer"],
+                "cer": adapter_metrics["cer"] - base_metrics["cer"],
+            }
+        },
+        "group_metrics": _summarize_group_metrics(
+            metadata_rows=filtered_metadata_rows,
+            normalized_references=filtered_normalized_references,
+            normalized_predictions_by_model=normalized_predictions_by_model,
+            group_fields=config.group_fields,
+            min_group_samples=config.min_group_samples,
+            max_groups_per_field=config.max_groups_per_field,
+        ),
+        "pairwise_vs_base": _summarize_pairwise_examples(
+            metadata_rows=filtered_metadata_rows,
+            raw_references=filtered_raw_references,
+            raw_predictions_by_model=raw_predictions_by_model,
+            normalized_references=filtered_normalized_references,
+            normalized_predictions_by_model=normalized_predictions_by_model,
+            top_examples=config.top_examples,
+        ),
+        "artifacts": {
+            "report_path": str(analysis_dir / "report.json"),
+            "pairwise_predictions_jsonl": str(pairwise_predictions_path),
+        },
+    }
+    _write_json(analysis_dir / "report.json", report)
+    _write_run_progress(
+        analysis_dir,
+        {
+            "stage": "complete",
+            "updated_at_utc": _now_iso(),
+            "status": "complete",
+            "samples_total": expected_rows,
+            "filtered_samples": len(selected_indexes),
+        },
+        commit=True,
+    )
+    artifacts_volume.commit()
+    hf_cache_volume.commit()
+    return report
+
+
+def _evaluate_adapter_dataset_impl(config: AdapterDatasetEvalConfig) -> dict[str, Any]:
+    if not config.source_run_id:
+        raise ValueError("source_run_id is required for adapter dataset evaluation")
+
+    import torch
+    from peft import PeftModel
+
+    hf_token = _get_hf_token()
+    source_dir = ARTIFACTS_DIR / config.source_run_id
+    adapter_dir = source_dir / "adapter"
+    if not adapter_dir.exists():
+        raise FileNotFoundError(f"Missing adapter directory: {adapter_dir}")
+
+    eval_run_id = f"{config.eval_name}-{_now_utc()}"
+    eval_dir = ARTIFACTS_DIR / eval_run_id
+    _ensure_dir(eval_dir)
+    _ensure_dir(_run_progress_dir(eval_dir))
+
+    processor = _build_processor(config.base_model, language=config.language, task=config.task)
+    dataset, audio_column, text_column = _load_dataset_split(config.eval_dataset, token=hf_token)
+    print(f"Starting adapter dataset eval {eval_run_id} on {len(dataset)} samples")
+    _write_run_progress(
+        eval_dir,
+        {
+            "stage": "eval_dataset",
+            "updated_at_utc": _now_iso(),
+            "status": "starting",
+            "source_run_id": config.source_run_id,
+            "samples_total": len(dataset),
+            "models_total": 2,
+        },
+        commit=True,
+    )
+
+    print("Evaluating base model")
+    base_model = _load_base_model(
+        config.base_model,
+        attn_implementation=config.attn_implementation,
+    )
+    base_payload = _predict_dataset(
+        model=base_model,
+        processor=processor,
+        dataset=dataset,
+        audio_column=audio_column,
+        text_column=text_column,
+        language=config.language,
+        task=config.task,
+        max_new_tokens=config.max_new_tokens,
+        batch_size=config.per_device_eval_batch_size,
+        phase_name="eval base",
+        progress_path=_phase_progress_path(eval_dir, "base"),
+        progress_log_interval_batches=25,
+    )
+    del base_model
+    torch.cuda.empty_cache()
+
+    print(f"Evaluating adapter {config.adapter_label} from {adapter_dir}")
+    _write_run_progress(
+        eval_dir,
+        {
+            "stage": "eval_dataset",
+            "updated_at_utc": _now_iso(),
+            "status": "running",
+            "current_model": config.adapter_label,
+            "source_run_id": config.source_run_id,
+            "samples_total": len(dataset),
+            "models_total": 2,
+        },
+        commit=True,
+    )
+    base_model = _load_base_model(
+        config.base_model,
+        attn_implementation=config.attn_implementation,
+    )
+    adapter_model = PeftModel.from_pretrained(base_model, str(adapter_dir))
+    adapter_payload = _predict_dataset(
+        model=adapter_model,
+        processor=processor,
+        dataset=dataset,
+        audio_column=audio_column,
+        text_column=text_column,
+        language=config.language,
+        task=config.task,
+        max_new_tokens=config.max_new_tokens,
+        batch_size=config.per_device_eval_batch_size,
+        phase_name=f"eval {config.adapter_label}",
+        progress_path=_phase_progress_path(eval_dir, _sanitize_artifact_component(config.adapter_label)),
+        progress_log_interval_batches=25,
+    )
+    del adapter_model
+    del base_model
+    torch.cuda.empty_cache()
+
+    metadata_rows = base_payload["metadata_rows"]
+    raw_references = base_payload["references"]
+    normalized_references = base_payload["normalized_references"]
+    raw_predictions_by_model = {
+        "base": base_payload["predictions"],
+        config.adapter_label: adapter_payload["predictions"],
+    }
+    normalized_predictions_by_model = {
+        "base": base_payload["normalized_predictions"],
+        config.adapter_label: adapter_payload["normalized_predictions"],
+    }
+    overall_metrics = {
+        label: _compute_text_metrics(normalized_references, predictions)
+        for label, predictions in normalized_predictions_by_model.items()
+    }
+    base_metrics = overall_metrics["base"]
+    adapter_metrics = overall_metrics[config.adapter_label]
+
+    pairwise_predictions_path = eval_dir / "pairwise_predictions.jsonl"
+    _write_pairwise_prediction_rows(
+        output_path=pairwise_predictions_path,
+        metadata_rows=metadata_rows,
+        raw_references=raw_references,
+        raw_predictions_by_model=raw_predictions_by_model,
+        normalized_references=normalized_references,
+        normalized_predictions_by_model=normalized_predictions_by_model,
+    )
+
+    report = {
+        "created_at_utc": datetime.now(tz=UTC).isoformat(),
+        "eval_run_id": eval_run_id,
+        "source_run_id": config.source_run_id,
+        "runtime": {
+            "modal_gpu": os.environ.get("MODAL_GPU_LABEL", "unknown"),
+            "attn_implementation": config.attn_implementation,
+            "base_model": config.base_model,
+        },
+        "dataset": {
+            "name": config.eval_dataset.name,
+            "config": config.eval_dataset.config,
+            "config_names": config.eval_dataset.config_names,
+            "split": config.eval_dataset.split,
+            "audio_column": audio_column,
+            "text_column": text_column,
+            "samples": len(dataset),
+            "requested": asdict(config.eval_dataset),
+        },
+        "overall_metrics": overall_metrics,
+        "deltas_vs_base": {
+            config.adapter_label: {
+                "wer": adapter_metrics["wer"] - base_metrics["wer"],
+                "cer": adapter_metrics["cer"] - base_metrics["cer"],
+            }
+        },
+        "group_metrics": _summarize_group_metrics(
+            metadata_rows=metadata_rows,
+            normalized_references=normalized_references,
+            normalized_predictions_by_model=normalized_predictions_by_model,
+            group_fields=config.group_fields,
+            min_group_samples=config.min_group_samples,
+            max_groups_per_field=config.max_groups_per_field,
+        ),
+        "pairwise_vs_base": _summarize_pairwise_examples(
+            metadata_rows=metadata_rows,
+            raw_references=raw_references,
+            raw_predictions_by_model=raw_predictions_by_model,
+            normalized_references=normalized_references,
+            normalized_predictions_by_model=normalized_predictions_by_model,
+            top_examples=config.top_examples,
+        ),
+        "artifacts": {
+            "report_path": str(eval_dir / "report.json"),
+            "pairwise_predictions_jsonl": str(pairwise_predictions_path),
+            "progress_path": str(_run_progress_path(eval_dir)),
+        },
+    }
+    _write_json(eval_dir / "report.json", report)
+    _write_run_progress(
+        eval_dir,
+        {
+            "stage": "complete",
+            "updated_at_utc": _now_iso(),
+            "status": "complete",
+            "source_run_id": config.source_run_id,
+            "samples_total": len(dataset),
+            "models_total": 2,
+        },
+        commit=True,
+    )
+    artifacts_volume.commit()
+    hf_cache_volume.commit()
+    print(f"Finished adapter dataset eval {eval_run_id}")
+    return report
+
+
 def _worker_script_path() -> Path:
     return Path(__file__)
 
@@ -4374,6 +5415,198 @@ def _apply_peft_adapter_scale(model: Any, adapter_scale: float) -> None:
             if adapter_name not in base_scales:
                 base_scales[adapter_name] = float(current_scale)
             scaling[adapter_name] = base_scales[adapter_name] * adapter_scale
+
+
+def _adapter_dir_for_merge_source(source: AdapterMergeSource) -> Path:
+    if source.adapter_dir:
+        path = Path(source.adapter_dir)
+        return path if path.is_absolute() else ARTIFACTS_DIR / source.adapter_dir.lstrip("/")
+    return ARTIFACTS_DIR / source.run_id / "adapter"
+
+
+def _promote_selected_adapter_save(adapter_dir: Path, adapter_name: str) -> None:
+    if (adapter_dir / "adapter_config.json").exists():
+        return
+    nested_dir = adapter_dir / adapter_name
+    if not nested_dir.exists():
+        raise FileNotFoundError(
+            f"Merged adapter save did not create adapter_config.json at {adapter_dir} "
+            f"or nested adapter directory {nested_dir}"
+        )
+    for child in nested_dir.iterdir():
+        target = adapter_dir / child.name
+        if target.exists():
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        shutil.move(str(child), str(target))
+    shutil.rmtree(nested_dir)
+
+
+def _merge_lora_adapters_impl(config: AdapterMergeConfig) -> dict[str, Any]:
+    import torch
+    from peft import PeftModel
+
+    if not config.recipes:
+        raise ValueError("At least one adapter merge recipe is required")
+
+    batch_run_id = f"{config.merge_name}-{_now_utc()}"
+    batch_dir = ARTIFACTS_DIR / batch_run_id
+    _ensure_dir(batch_dir)
+    _write_run_progress(
+        batch_dir,
+        {
+            "stage": "merge_lora_adapters",
+            "status": "starting",
+            "updated_at_utc": _now_iso(),
+            "recipes_total": len(config.recipes),
+            "recipes_done": 0,
+        },
+        commit=True,
+    )
+
+    merged_runs: list[dict[str, Any]] = []
+    for recipe_index, recipe in enumerate(config.recipes, start=1):
+        recipe_label = _sanitize_artifact_component(recipe.label)
+        run_id = f"{config.merge_name}-{recipe_label}-{_now_utc()}"
+        run_dir = ARTIFACTS_DIR / run_id
+        adapter_dir = run_dir / "adapter"
+        _ensure_dir(adapter_dir)
+        _write_run_progress(
+            run_dir,
+            {
+                "stage": "merge_lora_adapters",
+                "status": "loading_base_model",
+                "updated_at_utc": _now_iso(),
+                "recipe_label": recipe_label,
+                "sources": [asdict(source) for source in recipe.sources],
+            },
+            commit=True,
+        )
+
+        base_model = _load_base_model(config.base_model, attn_implementation=config.attn_implementation)
+        peft_model = None
+        adapter_names: list[str] = []
+        weights: list[float] = []
+        seen_adapter_names: set[str] = set()
+        for source_index, source in enumerate(recipe.sources, start=1):
+            adapter_name = _sanitize_artifact_component(source.label or source.run_id)
+            if adapter_name in seen_adapter_names:
+                adapter_name = f"{adapter_name}-{source_index}"
+            seen_adapter_names.add(adapter_name)
+            source_adapter_dir = _adapter_dir_for_merge_source(source)
+            if not (source_adapter_dir / "adapter_config.json").exists():
+                raise FileNotFoundError(f"Adapter config not found for merge source: {source_adapter_dir}")
+            if peft_model is None:
+                peft_model = PeftModel.from_pretrained(
+                    base_model,
+                    str(source_adapter_dir),
+                    adapter_name=adapter_name,
+                )
+            else:
+                peft_model.load_adapter(str(source_adapter_dir), adapter_name=adapter_name)
+            adapter_names.append(adapter_name)
+            weights.append(float(source.weight))
+
+        if peft_model is None:
+            raise RuntimeError(f"Recipe '{recipe_label}' did not load any adapters")
+
+        merged_adapter_name = "merged"
+        _write_run_progress(
+            run_dir,
+            {
+                "stage": "merge_lora_adapters",
+                "status": "merging",
+                "updated_at_utc": _now_iso(),
+                "recipe_label": recipe_label,
+                "adapter_names": adapter_names,
+                "weights": weights,
+                "combination_type": config.combination_type,
+            },
+            commit=True,
+        )
+        peft_model.add_weighted_adapter(
+            adapters=adapter_names,
+            weights=weights,
+            adapter_name=merged_adapter_name,
+            combination_type=config.combination_type,
+        )
+        peft_model.set_adapter(merged_adapter_name)
+        peft_model.save_pretrained(
+            str(adapter_dir),
+            selected_adapters=[merged_adapter_name],
+            safe_serialization=True,
+        )
+        _promote_selected_adapter_save(adapter_dir, merged_adapter_name)
+        processor = _build_processor(config.base_model, language=config.language, task=config.task)
+        processor.save_pretrained(str(adapter_dir))
+
+        report = {
+            "run_id": run_id,
+            "batch_run_id": batch_run_id,
+            "created_at_utc": datetime.now(tz=UTC).isoformat(),
+            "base_model": config.base_model,
+            "attn_implementation": config.attn_implementation,
+            "combination_type": config.combination_type,
+            "recipe": {
+                "label": recipe_label,
+                "sources": [
+                    {
+                        **asdict(source),
+                        "resolved_adapter_dir": str(_adapter_dir_for_merge_source(source)),
+                    }
+                    for source in recipe.sources
+                ],
+                "weight_sum": sum(weights),
+            },
+            "artifacts": {
+                "adapter_dir": str(adapter_dir),
+                "report_path": str(run_dir / "report.json"),
+            },
+        }
+        _write_json(run_dir / "report.json", report)
+        _write_run_progress(
+            run_dir,
+            {
+                "stage": "merge_lora_adapters",
+                "status": "complete",
+                "updated_at_utc": _now_iso(),
+                "recipe_label": recipe_label,
+                "adapter_dir": str(adapter_dir),
+            },
+            commit=True,
+        )
+        merged_runs.append(report)
+        _write_run_progress(
+            batch_dir,
+            {
+                "stage": "merge_lora_adapters",
+                "status": "running" if recipe_index < len(config.recipes) else "complete",
+                "updated_at_utc": _now_iso(),
+                "recipes_total": len(config.recipes),
+                "recipes_done": recipe_index,
+                "latest_run_id": run_id,
+            },
+            commit=True,
+        )
+        del peft_model
+        del base_model
+        torch.cuda.empty_cache()
+
+    batch_report = {
+        "batch_run_id": batch_run_id,
+        "created_at_utc": datetime.now(tz=UTC).isoformat(),
+        "merged_runs": merged_runs,
+        "artifacts": {
+            "batch_dir": str(batch_dir),
+            "report_path": str(batch_dir / "report.json"),
+        },
+    }
+    _write_json(batch_dir / "report.json", batch_report)
+    artifacts_volume.commit()
+    hf_cache_volume.commit()
+    return batch_report
 
 
 def _build_svarah_sweep_candidates(config: SvarahInferenceSweepConfig) -> list[dict[str, Any]]:
@@ -4490,9 +5723,14 @@ def _aggregate_sweep_progress(run_dir: Path, worker_payloads: list[dict[str, Any
             "status": "pending",
         }
         if progress_path.exists():
-            phase_state.update(json.loads(progress_path.read_text(encoding="utf-8")))
-            status = str(phase_state.get("status") or "running")
-            phase_state["status"] = "running" if status == "pending" else status
+            try:
+                raw_progress = progress_path.read_text(encoding="utf-8")
+                if raw_progress.strip():
+                    phase_state.update(json.loads(raw_progress))
+                    status = str(phase_state.get("status") or "running")
+                    phase_state["status"] = "running" if status == "pending" else status
+            except (OSError, json.JSONDecodeError):
+                phase_state["status"] = "running"
         if Path(payload["output_path"]).exists():
             phase_state["status"] = "complete"
             phase_state["samples_done"] = int(payload["sample_count"])
@@ -4596,6 +5834,7 @@ def _compute_oracle_summary(
     raw_predictions_by_model: dict[str, list[str]],
     normalized_predictions_by_model: dict[str, list[str]],
     baseline_label: str,
+    preview_limit: int = 0,
 ) -> dict[str, Any]:
     from jiwer import cer, wer
 
@@ -4629,30 +5868,56 @@ def _compute_oracle_summary(
         normalized_references,
         normalized_predictions_by_model[baseline_label],
     )
-    return {
+    summary = {
         "metrics": metrics,
         "delta_vs_baseline": {
             "wer": metrics["wer"] - baseline_metrics["wer"],
             "cer": metrics["cer"] - baseline_metrics["cer"],
         },
         "choice_counts": choice_counts,
-        "preview": [
+    }
+    if preview_limit > 0:
+        summary["preview"] = [
             {
                 "reference": raw_references[index],
                 "prediction": oracle_raw_predictions[index],
             }
-            for index in range(min(5, len(raw_references)))
-        ],
-    }
+            for index in range(min(preview_limit, len(raw_references)))
+        ]
+    return summary
 
 
 def _run_svarah_inference_sweep_impl(config: SvarahInferenceSweepConfig) -> dict[str, Any]:
     hf_token = _get_hf_token()
-    dataset, audio_column, text_column = _load_dataset_split(config.eval_dataset, token=hf_token)
-    sweep_run_id = f"{config.sweep_name}-{_now_utc()}"
+    sweep_run_id = (
+        _sanitize_artifact_component(config.run_id)
+        if config.run_id
+        else f"{config.sweep_name}-{_now_utc()}"
+    )
     run_dir = ARTIFACTS_DIR / sweep_run_id
     progress_dir = _run_progress_dir(run_dir)
     _ensure_dir(progress_dir)
+    print(f"[sweep] run_id={sweep_run_id} status=loading_eval_dataset", flush=True)
+    _write_run_progress(
+        run_dir,
+        {
+            "stage": "svarah_inference_sweep",
+            "updated_at_utc": _now_iso(),
+            "status": "loading_eval_dataset",
+            "dataset_requested": asdict(config.eval_dataset),
+        },
+        commit=True,
+    )
+    dataset, audio_column, text_column = _load_dataset_split(
+        config.eval_dataset,
+        token=hf_token,
+        progress_run_dir=run_dir,
+        progress_payload={
+            "stage": "svarah_inference_sweep",
+            "status": "loading_eval_dataset",
+            "dataset_requested": asdict(config.eval_dataset),
+        },
+    )
 
     candidates = _build_svarah_sweep_candidates(config)
     if not candidates:
@@ -4761,6 +6026,7 @@ def _run_svarah_inference_sweep_impl(config: SvarahInferenceSweepConfig) -> dict
             "modal_gpu": os.environ.get("MODAL_GPU_LABEL", "unknown"),
             "attn_implementation": config.attn_implementation,
             "distributed_gpu_count": config.distributed_gpu_count,
+            "base_models": config.base_models,
         },
         "dataset": {
             "name": config.eval_dataset.name,
@@ -4770,6 +6036,7 @@ def _run_svarah_inference_sweep_impl(config: SvarahInferenceSweepConfig) -> dict
             "audio_column": audio_column,
             "text_column": text_column,
             "samples": len(dataset),
+            "requested": asdict(config.eval_dataset),
         },
         "baseline_label": baseline_label,
         "candidates": candidates,
@@ -4781,6 +6048,7 @@ def _run_svarah_inference_sweep_impl(config: SvarahInferenceSweepConfig) -> dict
             raw_predictions_by_model=raw_predictions_by_model,
             normalized_predictions_by_model=normalized_predictions_by_model,
             baseline_label=baseline_label,
+            preview_limit=config.top_examples,
         ),
         "group_metrics": _summarize_group_metrics(
             metadata_rows=metadata_rows,
@@ -5185,6 +6453,14 @@ def _run_hard_example_mining_impl(config: HardExampleMiningConfig) -> dict[str, 
     )
     raw_references = collected["turbo"]["references"]
     normalized_references = collected["turbo"]["normalized_references"]
+    quality_references = list(raw_references)
+    if config.normalize_transcripts:
+        transcript_normalizer = BasicTextNormalizer()
+        quality_references = [_strip_transcript_markup(str(text or "")) for text in raw_references]
+        normalized_references = [
+            _clean_transcript_text(text, normalizer=transcript_normalizer)
+            for text in raw_references
+        ]
     turbo_predictions = collected["turbo"]["normalized_predictions"]
     teacher_predictions = collected["teacher"]["normalized_predictions"]
     metadata_rows = collected["turbo"]["metadata_rows"]
@@ -5194,7 +6470,7 @@ def _run_hard_example_mining_impl(config: HardExampleMiningConfig) -> dict[str, 
     rng = random.Random(config.seed)
     for index, normalized_reference in enumerate(normalized_references):
         row = dataset[index]
-        raw_reference = str(raw_references[index] or "")
+        raw_reference = str(quality_references[index] or "")
         keep, reject_reasons, metrics = _passes_hard_mining_quality_gates(
             config=config,
             raw_reference=raw_reference,
@@ -5608,6 +6884,7 @@ def _eval_worker_main(config_path: str) -> None:
         "references": prediction_payload["references"],
         "normalized_predictions": prediction_payload["normalized_predictions"],
         "normalized_references": prediction_payload["normalized_references"],
+        "metadata_rows": prediction_payload["metadata_rows"],
     }
     _write_phase_progress(Path(payload["output_path"]), result_payload, commit=True)
 
@@ -6448,6 +7725,85 @@ def _train_only_distributed_impl(config: TrainConfig) -> dict[str, Any]:
     return partial_report
 
 
+def _train_only_single_gpu_impl(config: TrainConfig) -> dict[str, Any]:
+    hf_token = _get_hf_token()
+    run_id = f"{config.experiment_name}-{_now_utc()}"
+    run_dir = ARTIFACTS_DIR / run_id
+    adapter_dir = run_dir / "adapter"
+    _ensure_dir(adapter_dir)
+    _write_run_progress(
+        run_dir,
+        {
+            "stage": "startup",
+            "updated_at_utc": _now_iso(),
+            "experiment_name": config.experiment_name,
+            "distributed_gpu_count": config.distributed_gpu_count,
+        },
+        commit=True,
+    )
+    _write_run_progress(
+        run_dir,
+        {
+            "stage": "build_processor",
+            "updated_at_utc": _now_iso(),
+            "base_model": config.base_model,
+        },
+        commit=True,
+    )
+    processor = _build_processor(config.base_model, language=config.language, task=config.task)
+    split_payload = _resolve_train_validation_splits(config, token=hf_token, run_dir=run_dir)
+    train_split = split_payload["train_split"]
+    train_audio_column = split_payload["train_audio_column"]
+    train_text_column = split_payload["train_text_column"]
+    validation_split = split_payload["validation_split"]
+    validation_source_summary = split_payload["validation_source_summary"]
+
+    train_features, train_source_summaries = _build_train_features_and_summaries(
+        config,
+        processor=processor,
+        token=hf_token,
+        train_split=train_split,
+        train_audio_column=train_audio_column,
+        train_text_column=train_text_column,
+        run_dir=run_dir,
+    )
+
+    training_phase = _run_single_gpu_training_phase(
+        config,
+        processor=processor,
+        train_features=train_features,
+        run_dir=run_dir,
+        adapter_dir=adapter_dir,
+    )
+    partial_report = _build_partial_train_report(
+        config,
+        run_id=run_id,
+        train_split=train_split,
+        train_audio_column=train_audio_column,
+        train_text_column=train_text_column,
+        validation_split=validation_split,
+        validation_source_summary=validation_source_summary,
+        train_source_summaries=train_source_summaries,
+        training_phase=training_phase,
+        adapter_dir=adapter_dir,
+        run_dir=run_dir,
+    )
+    _write_json(run_dir / "partial_report.json", partial_report)
+    _write_json(run_dir / "train_config.json", asdict(config))
+    artifacts_volume.commit()
+    hf_cache_volume.commit()
+    return partial_report
+
+
+@app.function(
+    timeout=60 * 5,
+    volumes={str(ARTIFACTS_DIR): artifacts_volume},
+)
+def sweep_artifact_status_remote(run_id: str) -> dict[str, Any]:
+    artifacts_volume.reload()
+    return _sweep_artifact_status(run_id)
+
+
 @app.function(
     gpu=TRAIN_GPU,
     timeout=60 * 60 * 8,
@@ -6461,6 +7817,23 @@ def train_and_eval_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
     os.environ["MODAL_GPU_LABEL"] = TRAIN_GPU
     config = _normalize_train_config(config_payload)
     return _train_and_eval_impl(config)
+
+
+@app.function(
+    gpu=TRAIN_GPU,
+    timeout=60 * 60 * 8,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={
+        str(ARTIFACTS_DIR): artifacts_volume,
+        str(HF_CACHE_DIR): hf_cache_volume,
+    },
+)
+def train_only_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
+    os.environ["MODAL_GPU_LABEL"] = TRAIN_GPU
+    config = _normalize_train_config(config_payload)
+    if config.distributed_gpu_count != 1:
+        config = replace(config, distributed_gpu_count=1)
+    return _train_only_single_gpu_impl(config)
 
 
 @app.function(
@@ -6731,6 +8104,21 @@ def build_training_manifest_remote(config_payload: dict[str, Any]) -> dict[str, 
 
 
 @app.function(
+    gpu=TRAIN_GPU,
+    timeout=60 * 60 * 2,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={
+        str(ARTIFACTS_DIR): artifacts_volume,
+        str(HF_CACHE_DIR): hf_cache_volume,
+    },
+)
+def merge_lora_adapters_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
+    os.environ["MODAL_GPU_LABEL"] = TRAIN_GPU
+    config = _normalize_adapter_merge_config(config_payload)
+    return _merge_lora_adapters_impl(config)
+
+
+@app.function(
     timeout=60 * 60 * 6,
     volumes={str(ARTIFACTS_DIR): artifacts_volume},
 )
@@ -6755,6 +8143,34 @@ def analyze_svarah_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.function(
+    timeout=60 * 60,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={
+        str(ARTIFACTS_DIR): artifacts_volume,
+        str(HF_CACHE_DIR): hf_cache_volume,
+    },
+)
+def analyze_saved_eval_run_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
+    config = _normalize_saved_eval_analysis_config(config_payload)
+    return _analyze_saved_eval_run_impl(config)
+
+
+@app.function(
+    gpu=TRAIN_GPU,
+    timeout=60 * 60 * 4,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={
+        str(ARTIFACTS_DIR): artifacts_volume,
+        str(HF_CACHE_DIR): hf_cache_volume,
+    },
+)
+def evaluate_adapter_dataset_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
+    os.environ["MODAL_GPU_LABEL"] = TRAIN_GPU
+    config = _normalize_adapter_dataset_eval_config(config_payload)
+    return _evaluate_adapter_dataset_impl(config)
+
+
+@app.function(
     gpu=FIVE_GPU_TRAIN_GPU,
     timeout=60 * 60 * 4,
     secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
@@ -6765,6 +8181,21 @@ def analyze_svarah_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
 )
 def svarah_inference_sweep_5gpu_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
     os.environ["MODAL_GPU_LABEL"] = FIVE_GPU_TRAIN_GPU
+    config = _normalize_svarah_inference_sweep_config(config_payload)
+    return _run_svarah_inference_sweep_impl(config)
+
+
+@app.function(
+    gpu=TRAIN_GPU,
+    timeout=60 * 60 * 4,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={
+        str(ARTIFACTS_DIR): artifacts_volume,
+        str(HF_CACHE_DIR): hf_cache_volume,
+    },
+)
+def svarah_inference_sweep_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
+    os.environ["MODAL_GPU_LABEL"] = TRAIN_GPU
     config = _normalize_svarah_inference_sweep_config(config_payload)
     return _run_svarah_inference_sweep_impl(config)
 
@@ -6782,6 +8213,102 @@ def hard_example_mining_5gpu_remote(config_payload: dict[str, Any]) -> dict[str,
     os.environ["MODAL_GPU_LABEL"] = FIVE_GPU_TRAIN_GPU
     config = _normalize_hard_example_mining_config(config_payload)
     return _run_hard_example_mining_impl(config)
+
+
+@app.function(
+    gpu=TRAIN_GPU,
+    timeout=60 * 60 * 8,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={
+        str(ARTIFACTS_DIR): artifacts_volume,
+        str(HF_CACHE_DIR): hf_cache_volume,
+    },
+)
+def hard_example_mining_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
+    os.environ["MODAL_GPU_LABEL"] = TRAIN_GPU
+    config = _normalize_hard_example_mining_config(config_payload)
+    if config.distributed_gpu_count != 1:
+        config = replace(config, distributed_gpu_count=1)
+    return _run_hard_example_mining_impl(config)
+
+
+_TERMINAL_FUNCTION_INPUT_STATUSES = {
+    "SUCCESS",
+    "FAILURE",
+    "INIT_FAILURE",
+    "TERMINATED",
+    "TIMEOUT",
+}
+
+
+def _function_call_graph_payload(call: Any) -> dict[str, Any]:
+    graph = call.get_call_graph()
+    inputs = []
+    for item in graph:
+        status_name = getattr(item.status, "name", str(item.status))
+        inputs.append(
+            {
+                "input_id": item.input_id,
+                "task_id": item.task_id,
+                "status": status_name,
+                "function_name": item.function_name,
+                "module_name": item.module_name,
+                "children": len(item.children),
+            }
+        )
+    statuses = [item["status"] for item in inputs]
+    return {
+        "inputs": inputs,
+        "statuses": statuses,
+        "terminal": bool(statuses)
+        and all(status in _TERMINAL_FUNCTION_INPUT_STATUSES for status in statuses),
+    }
+
+
+def _monitor_remote_sweep_call(
+    *,
+    call: Any,
+    run_id: str,
+    interval_seconds: int,
+) -> dict[str, Any]:
+    interval = max(5, int(interval_seconds))
+    while True:
+        try:
+            call_graph = _function_call_graph_payload(call)
+        except Exception as exc:
+            call_graph = {"error": type(exc).__name__, "message": str(exc), "terminal": False}
+
+        try:
+            artifact_status = sweep_artifact_status_remote.remote(run_id)
+        except Exception as exc:
+            artifact_status = {
+                "error": type(exc).__name__,
+                "message": str(exc),
+                "progress_exists": False,
+                "report_exists": False,
+            }
+
+        progress = artifact_status.get("progress") if isinstance(artifact_status, dict) else None
+        percent = None
+        if isinstance(progress, dict):
+            percent = progress.get("percent_complete")
+        status_line = {
+            "run_id": run_id,
+            "call_statuses": call_graph.get("statuses"),
+            "terminal": call_graph.get("terminal"),
+            "progress_exists": artifact_status.get("progress_exists"),
+            "report_exists": artifact_status.get("report_exists"),
+            "progress_stage": progress.get("stage") if isinstance(progress, dict) else None,
+            "progress_status": progress.get("status") if isinstance(progress, dict) else None,
+            "percent_complete": percent,
+        }
+        print(f"[monitor] {json.dumps(status_line, sort_keys=True)}", flush=True)
+
+        if call_graph.get("terminal"):
+            break
+        time.sleep(interval)
+
+    return call.get()
 
 
 @app.local_entrypoint()
@@ -6838,6 +8365,7 @@ def main(
     anchor_max_samples: int = 0,
     validation_max_samples: int = 0,
     svarah_max_samples: int = 0,
+    eval_max_samples: int = 0,
     audit_name: str = "dataset-audit",
     audit_sample_limit: int = 500,
     audit_seed: int = 42,
@@ -6855,12 +8383,16 @@ def main(
     manifest_export_audio: bool = True,
     manifest_normalize_transcripts: bool = True,
     manifest_metadata_fields: str = "",
+    manifest_balance_fields: str = "",
+    manifest_exclude_paths: str = "",
     audio_verify_name: str = "audio-manifest-verify",
+    audio_verify_max_workers: int = 32,
     survey_name: str = "dataset-config-survey",
     survey_config_regex: str = "",
     survey_config_names: str = "",
     survey_max_configs: int = 0,
     survey_max_workers: int = 6,
+    survey_max_rows_per_config: int = 0,
     survey_sample_transcripts_per_config: int = 3,
     survey_top_k: int = 25,
     download_name: str = "external-archives",
@@ -6884,10 +8416,13 @@ def main(
     analysis_filters: str = "",
     analysis_min_group_samples: int = 100,
     analysis_max_groups_per_field: int = 12,
-    analysis_top_examples: int = 5,
+    analysis_top_examples: int = 0,
     sweep_name: str = "svarah-inference-sweep",
     sweep_base_models: str = BASE_MODEL,
     sweep_adapter_scales: str = "1.0",
+    merge_name: str = "adapter-merge",
+    merge_recipes: str = "",
+    merge_combination_type: str = "linear",
     hard_base_model: str = BASE_MODEL,
     hard_teacher_model: str = "openai/whisper-large-v3",
     hard_min_word_count: int = 4,
@@ -6910,7 +8445,10 @@ def main(
     preprocess_num_workers: int = 0,
     preprocess_batch_size: int = 8,
     distributed_gpu_count: int = 1,
-    gradient_checkpointing: bool = True,
+    detach_remote: bool = False,
+    monitor_remote: bool = False,
+    remote_monitor_interval_seconds: int = 30,
+    gradient_checkpointing: bool = False,
     ddp_find_unused_parameters: bool = False,
     skip_validation_eval: bool = False,
     optim: str = "adamw_torch_fused",
@@ -6919,6 +8457,9 @@ def main(
     eval_config_names = _parse_config_names(eval_config_name)
     validation_config_names = _parse_config_names(validation_config_name)
     anchor_config_names = _parse_config_names(anchor_config_name)
+    if eval_max_samples and svarah_max_samples and eval_max_samples != svarah_max_samples:
+        raise ValueError("Specify only one of eval_max_samples or svarah_max_samples, or use the same value")
+    resolved_eval_max_samples = eval_max_samples or svarah_max_samples
 
     train_dataset_config = DatasetConfig(
         name=train_dataset,
@@ -6941,7 +8482,7 @@ def main(
         split=eval_split or None,
         audio_column=eval_audio_column or None,
         text_column=eval_text_column or None,
-        max_samples=svarah_max_samples or None,
+        max_samples=resolved_eval_max_samples or None,
         max_word_count=eval_max_word_count or None,
         min_duration_seconds=eval_min_duration_seconds or None,
         max_duration_seconds=eval_max_duration_seconds or None,
@@ -7031,6 +8572,7 @@ def main(
             config_names=selected_config_names,
             max_configs=survey_max_configs or None,
             max_workers=survey_max_workers,
+            max_rows_per_config=survey_max_rows_per_config or None,
             sample_transcripts_per_config=survey_sample_transcripts_per_config,
             top_k=survey_top_k,
         )
@@ -7091,6 +8633,8 @@ def main(
             export_audio=manifest_export_audio,
             normalize_transcripts=manifest_normalize_transcripts,
             metadata_fields=[field.strip() for field in manifest_metadata_fields.split(",") if field.strip()],
+            balance_fields=[field.strip() for field in manifest_balance_fields.split(",") if field.strip()],
+            exclude_manifest_paths=[path.strip() for path in manifest_exclude_paths.split(",") if path.strip()],
         )
         payload = build_training_manifest_remote.remote(asdict(manifest_config))
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -7124,7 +8668,24 @@ def main(
             normalize_transcripts=manifest_normalize_transcripts,
             metadata_fields=[field.strip() for field in manifest_metadata_fields.split(",") if field.strip()],
         )
-        payload = hard_example_mining_5gpu_remote.remote(asdict(hard_config))
+        remote_function = (
+            hard_example_mining_5gpu_remote
+            if distributed_gpu_count > 1
+            else hard_example_mining_remote
+        )
+        payload = remote_function.remote(asdict(hard_config))
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    if mode == "merge_lora_adapters":
+        merge_config = AdapterMergeConfig(
+            merge_name=merge_name,
+            recipes=_parse_adapter_merge_recipes(merge_recipes),
+            base_model=BASE_MODEL,
+            attn_implementation=attn_implementation,
+            combination_type=merge_combination_type,
+        )
+        payload = merge_lora_adapters_remote.remote(asdict(merge_config))
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
 
@@ -7134,6 +8695,7 @@ def main(
             dataset=train_dataset_config,
             sample_limit=profile_sample_limit or None,
             seed=audit_seed,
+            max_workers=audio_verify_max_workers,
         )
         payload = verify_audio_manifest_remote.remote(asdict(verify_config))
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -7185,6 +8747,67 @@ def main(
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
 
+    if mode == "analyze_saved_eval_run":
+        run_ids = [value.strip() for value in compare_run_ids.split(",") if value.strip()]
+        labels = [value.strip() for value in compare_labels.split(",") if value.strip()]
+        if not run_ids:
+            raise ValueError("compare_run_ids is required for analyze_saved_eval_run mode")
+        if labels and len(labels) != len(run_ids):
+            raise ValueError("compare_labels must match compare_run_ids length when provided")
+        if len(run_ids) != 1:
+            raise ValueError("analyze_saved_eval_run currently expects exactly one run id")
+
+        row_filters = {}
+        for item in [value.strip() for value in analysis_filters.split(",") if value.strip()]:
+            if "=" not in item:
+                raise ValueError(
+                    "analysis_filters entries must use key=value format, for example contains_digit=no"
+                )
+            key, value = item.split("=", maxsplit=1)
+            row_filters[key.strip()] = value.strip()
+
+        saved_analysis_config = SavedEvalAnalysisConfig(
+            analysis_name=analysis_name,
+            source_run_id=run_ids[0],
+            adapter_label=labels[0] if labels else "adapter",
+            eval_dataset=eval_dataset_config,
+            min_group_samples=analysis_min_group_samples,
+            max_groups_per_field=analysis_max_groups_per_field,
+            top_examples=analysis_top_examples,
+            row_filters=row_filters,
+            group_fields=[field.strip() for field in analysis_group_fields.split(",") if field.strip()],
+        )
+        payload = analyze_saved_eval_run_remote.remote(asdict(saved_analysis_config))
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    if mode == "evaluate_dataset":
+        run_id = existing_run_id.strip()
+        if not run_id:
+            run_ids = [value.strip() for value in compare_run_ids.split(",") if value.strip()]
+            if run_ids:
+                run_id = run_ids[0]
+        if not run_id:
+            raise ValueError("existing_run_id or compare_run_ids is required for evaluate_dataset mode")
+        labels = [value.strip() for value in compare_labels.split(",") if value.strip()]
+        eval_config = AdapterDatasetEvalConfig(
+            eval_name=analysis_name,
+            source_run_id=run_id,
+            adapter_label=labels[0] if labels else "adapter",
+            base_model=BASE_MODEL,
+            attn_implementation=attn_implementation,
+            eval_dataset=eval_dataset_config,
+            max_new_tokens=256,
+            per_device_eval_batch_size=per_device_eval_batch_size,
+            min_group_samples=analysis_min_group_samples,
+            max_groups_per_field=analysis_max_groups_per_field,
+            top_examples=analysis_top_examples,
+            group_fields=[field.strip() for field in analysis_group_fields.split(",") if field.strip()],
+        )
+        payload = evaluate_adapter_dataset_remote.remote(asdict(eval_config))
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
     if mode == "svarah_inference_sweep":
         base_models = _parse_config_names(sweep_base_models)
         if not base_models:
@@ -7224,7 +8847,39 @@ def main(
             top_examples=analysis_top_examples,
             group_fields=[field.strip() for field in analysis_group_fields.split(",") if field.strip()],
         )
-        payload = svarah_inference_sweep_5gpu_remote.remote(asdict(sweep_config))
+        remote_function = (
+            svarah_inference_sweep_5gpu_remote
+            if distributed_gpu_count > 1
+            else svarah_inference_sweep_remote
+        )
+        if detach_remote or monitor_remote:
+            submitted_run_id = f"{sweep_name}-{_now_utc()}"
+            sweep_config = replace(sweep_config, run_id=submitted_run_id)
+            call = remote_function.spawn(asdict(sweep_config))
+            payload = {
+                "status": "submitted_monitoring" if monitor_remote else "submitted",
+                "run_id": submitted_run_id,
+                "artifact_dir": str(ARTIFACTS_DIR / submitted_run_id),
+                "function_call_id": getattr(call, "object_id", None),
+                "local_uuid": getattr(call, "local_uuid", None),
+            }
+            try:
+                payload["dashboard_url"] = call.get_dashboard_url()
+            except Exception as exc:
+                payload["dashboard_url_error"] = str(exc)
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            if monitor_remote:
+                payload = _monitor_remote_sweep_call(
+                    call=call,
+                    run_id=submitted_run_id,
+                    interval_seconds=remote_monitor_interval_seconds,
+                )
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            return
+        if distributed_gpu_count > 1:
+            payload = remote_function.remote(asdict(sweep_config))
+        else:
+            payload = remote_function.remote(asdict(sweep_config))
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
 
@@ -7239,7 +8894,7 @@ def main(
             train_max_samples=train_max_samples or None,
             anchor_max_samples=anchor_max_samples or None,
             validation_max_samples=validation_max_samples or None,
-            svarah_max_samples=svarah_max_samples or None,
+            svarah_max_samples=resolved_eval_max_samples or None,
             num_train_epochs=num_train_epochs,
             learning_rate=learning_rate,
             rank=rank,
@@ -7285,7 +8940,7 @@ def main(
         train_max_samples=train_max_samples or None,
         anchor_max_samples=anchor_max_samples or None,
         validation_max_samples=validation_max_samples or None,
-        svarah_max_samples=svarah_max_samples or None,
+        svarah_max_samples=resolved_eval_max_samples or None,
         num_train_epochs=num_train_epochs,
         learning_rate=learning_rate,
         rank=rank,
@@ -7309,12 +8964,14 @@ def main(
     )
 
     if mode == "train_only":
-        if distributed_gpu_count == 4:
+        if distributed_gpu_count == 1:
+            partial_report = train_only_remote.remote(asdict(config))
+        elif distributed_gpu_count == 4:
             partial_report = train_only_4gpu_remote.remote(asdict(config))
         elif distributed_gpu_count == 5:
             partial_report = train_only_5gpu_remote.remote(asdict(config))
         else:
-            raise ValueError("train_only mode currently supports distributed_gpu_count=4 or 5 only")
+            raise ValueError("train_only mode currently supports distributed_gpu_count=1, 4, or 5 only")
         print(json.dumps(partial_report, indent=2, sort_keys=True))
         return
 
@@ -7340,7 +8997,7 @@ def main(
     if mode != "train_eval":
         raise ValueError(
             "Unsupported mode "
-            f"'{mode}'. Expected one of: train_eval, train_only, evaluate_saved_run, profile_train_selection, inspect_train, inspect_eval, profile_train, profile_anchor, survey_train_configs, download_external_archives, build_audit_manifest, build_training_manifest, build_hard_example_manifest, verify_audio_manifest, benchmark_step, analyze_svarah, svarah_inference_sweep"
+            f"'{mode}'. Expected one of: train_eval, train_only, evaluate_saved_run, evaluate_dataset, profile_train_selection, inspect_train, inspect_eval, profile_train, profile_anchor, survey_train_configs, download_external_archives, build_audit_manifest, build_training_manifest, build_hard_example_manifest, merge_lora_adapters, verify_audio_manifest, benchmark_step, analyze_svarah, analyze_saved_eval_run, svarah_inference_sweep"
         )
 
     if distributed_gpu_count == 4:

@@ -15,11 +15,16 @@ The training script also supports local JSONL manifests mounted from the artifac
 
 The training script now supports comma-separated config lists for dataset-backed supplements such as the confirmed Vaani district pool. This is the intended way to attach `Vaani supplement v1` as a second training source without pre-merging it offline.
 
-Current status as of April 23, 2026:
+Current status as of May 1, 2026:
 
 - the current full-Svarah inference sweep supersedes the earlier tiny-adapter read
 - no existing LoRA adapter or adapter scale beats `openai/whisper-large-v3-turbo` under the current eval path
 - plain `openai/whisper-large-v3` beats turbo strongly on Svarah
+- the April 24 ASR bakeoff confirms `openai/whisper-large-v3` is still the best measured single model on Svarah
+- NVIDIA `parakeet-tdt-0.6b-v2` is much faster than Whisper but loses badly on Svarah WER/CER
+- Cohere Transcribe served through vLLM is faster than Whisper turbo on one GPU, but less accurate on Svarah
+- Cohere dynamic LoRA adapters are not supported by vLLM today; the practical Cohere fine-tuning path is LoRA training, adapter merge, then vLLM serving of the merged checkpoint
+- Voxtral Mini 4B Realtime fits on one L40S, but the measured Svarah smoke run is not usable because it often emits phonetic English in non-Latin script
 - do not spend more training on the current curated or bucketed recipes
 
 Next research direction:
@@ -27,7 +32,10 @@ Next research direction:
 - build hard-example manifests where turbo is wrong, `large-v3` agrees with the transcript, and labels are clean
 - train only a small mined-data adapter first
 - separately evaluate a confidence/router path, because the oracle gap is large
+- test a merged Cohere LoRA checkpoint in vLLM only if we have a Cohere LoRA worth merging
 - if training continues, prefer encoder-only LoRA with base-KL preservation, mild SpecAugment, and possibly LoRA+
+
+The detailed May 1 backend bakeoff and Cohere/vLLM adapter decision live in [`docs/ACCENT-DATA-PIPELINE.md`](./ACCENT-DATA-PIPELINE.md#may-1-vllm-asr-backend-and-adapter-investigation).
 
 ## Why this setup
 
@@ -1107,6 +1115,75 @@ Read:
 - encoder-only LoRA reduced blast radius but did not create a win
 - this makes "more Common Voice hard examples" a weak next bet
 - the strongest remaining measured option is still plain `openai/whisper-large-v3` or a router that can pick large-v3 when turbo is likely wrong
+
+### 2026-04-24: Svarah ASR bakeoff
+
+Added [`tools/modal_asr_bakeoff.py`](../tools/modal_asr_bakeoff.py), a separate Modal bakeoff script for inference-only ASR comparisons. It is intentionally separate from the LoRA trainer because Cohere Transcribe and NVIDIA Parakeet need a newer/different runtime stack than the pinned training image.
+
+Run command:
+
+```bash
+modal run tools/modal_asr_bakeoff.py \
+  --mode full \
+  --bakeoff-name svarah-asr-bakeoff-full-v1 \
+  --bakeoff-models whisper_turbo,whisper_large_v3,parakeet_tdt_v2 \
+  --per-device-eval-batch-size 16 \
+  --distributed-gpu-count 5 \
+  --progress-log-interval-batches 1 \
+  --parallel-backend-jobs
+```
+
+Run details:
+
+- run id: `svarah-asr-bakeoff-full-v1-20260424-182510`
+- report: `/artifacts/svarah-asr-bakeoff-full-v1-20260424-182510/report.json`
+- pairwise predictions: `/artifacts/svarah-asr-bakeoff-full-v1-20260424-182510/pairwise_predictions.jsonl`
+- samples: full Svarah test split, `6656`
+- execution: Transformers and NeMo backend groups ran concurrently; each backend group used `H100!:5` while active
+
+Full Svarah metrics:
+
+| Model | WER | CER | Delta WER vs turbo |
+| --- | ---: | ---: | ---: |
+| `openai/whisper-large-v3` | `0.0711331797` | `0.0343750000` | `-0.0109897972` |
+| `openai/whisper-large-v3-turbo` | `0.0821229770` | `0.0390096867` | `0` |
+| `nvidia/parakeet-tdt-0.6b-v2` | `0.1306326288` | `0.0742090890` | `+0.0485096518` |
+
+Timing:
+
+| Model | Parallel RTFx | Single-GPU equivalent RTFx | Parallel inference seconds | Max worker wall seconds |
+| --- | ---: | ---: | ---: | ---: |
+| `parakeet_tdt_v2` | `1977.56` | `417.48` | `17.50` | `481.44` |
+| `whisper_turbo` | `827.48` | `188.29` | `41.83` | `459.29` |
+| `whisper_large_v3` | `480.65` | `100.12` | `72.01` | `347.76` |
+
+Oracle:
+
+| Metric | Value |
+| --- | ---: |
+| Oracle WER | `0.0495542550` |
+| Oracle CER | `0.0224726917` |
+| Oracle delta WER vs turbo | `-0.0325687220` |
+| Oracle delta CER vs turbo | `-0.0165369951` |
+
+Oracle choices:
+
+- turbo: `5066`
+- large-v3: `798`
+- Parakeet TDT: `792`
+
+Access/runtime notes:
+
+- `CohereLabs/cohere-transcribe-03-2026` was not included in the full run because the current Hugging Face token is not authorized for the gated model.
+- `nvidia/parakeet-unified-en-0.6b` failed smoke under the current NeMo image with `ConformerEncoder.__init__() got an unexpected keyword argument 'att_chunk_context_size'`.
+- Per-shard progress files were reliable during the run. The script now also writes backend-specific progress files to avoid last-writer-wins confusion when parallel backend groups are enabled.
+
+Read:
+
+- large-v3 is still the best measured single model for this benchmark.
+- Parakeet TDT is fast enough to be interesting for low-latency product paths, but not as the quality model for Indian-accent English on Svarah.
+- The router/oracle gap is large enough to justify a routing experiment if runtime cost is acceptable.
+- For training, the target should remain turbo failure cases that a stronger model already handles, not broad "Indian accent" data.
 
 ## Important caveats
 

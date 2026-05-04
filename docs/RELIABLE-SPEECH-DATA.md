@@ -8,13 +8,18 @@ The short version is simple:
 - the blocker is training data that does not match the target
 - the next full run should wait until the data passes a manual audit
 
-April 23 update:
+May 1 update:
 
 - the curated Common Voice 1k run did not beat base Whisper on full Svarah
 - the bucketed transfer 1k run also did not beat base Whisper on full Svarah
 - the inference-only Svarah sweep found that no existing adapter scale beats turbo
 - plain `openai/whisper-large-v3` beats turbo by a meaningful margin on full Svarah
-- the next step is stricter hard-example mining, not a larger run from the same selection logic
+- the April 30 non-Svarah-selected `vaani_cvlight_lr5@0.5` adapter produced the first clean Svarah-free improvement, but the gain is small
+- the May 1 routing probes did not beat the best fixed adapter; text-only routing collapsed to fixed adapter choices
+- Cohere Transcribe through vLLM is much faster than Whisper turbo on a single GPU, but less accurate on Svarah
+- Cohere dynamic LoRA adapters are not supported by vLLM today; preserving vLLM speed requires a merged checkpoint path
+- Voxtral Mini 4B Realtime is cheap enough for one L40S, but failed this English benchmark because of non-Latin phonetic outputs
+- the next step is no longer another broad Whisper LoRA run; it needs either better non-Svarah data, confidence/logprob routing, or a merged-Cohere proof
 
 ## Current conclusion
 
@@ -1336,6 +1341,65 @@ Read:
 - `large-v3` is the only reliable single-model improvement
 - the data signal should come from turbo-fail / large-v3-pass rows
 - a confidence router could be useful if runtime cost is acceptable, but the training path should first mine cleaner hard examples
+
+## April 24 ASR model bakeoff
+
+The April 23 sweep answered the LoRA question, but not the serving-model question. On April 24 we added a separate Modal ASR bakeoff script and compared Whisper turbo, Whisper large-v3, and NVIDIA Parakeet TDT v2 on the full Svarah test split.
+
+Run:
+
+```bash
+modal run tools/modal_asr_bakeoff.py \
+  --mode full \
+  --bakeoff-name svarah-asr-bakeoff-full-v1 \
+  --bakeoff-models whisper_turbo,whisper_large_v3,parakeet_tdt_v2 \
+  --per-device-eval-batch-size 16 \
+  --distributed-gpu-count 5 \
+  --progress-log-interval-batches 1 \
+  --parallel-backend-jobs
+```
+
+Artifacts:
+
+- run id: `svarah-asr-bakeoff-full-v1-20260424-182510`
+- report: `/artifacts/svarah-asr-bakeoff-full-v1-20260424-182510/report.json`
+- pairwise predictions: `/artifacts/svarah-asr-bakeoff-full-v1-20260424-182510/pairwise_predictions.jsonl`
+- samples: `6656`
+
+Metrics:
+
+| Model | WER | CER | Delta WER vs turbo |
+| --- | ---: | ---: | ---: |
+| `openai/whisper-large-v3` | `0.0711331797` | `0.0343750000` | `-0.0109897972` |
+| `openai/whisper-large-v3-turbo` | `0.0821229770` | `0.0390096867` | `0` |
+| `nvidia/parakeet-tdt-0.6b-v2` | `0.1306326288` | `0.0742090890` | `+0.0485096518` |
+
+Speed:
+
+| Model | Parallel RTFx | Single-GPU equivalent RTFx | Parallel inference seconds |
+| --- | ---: | ---: | ---: |
+| `parakeet_tdt_v2` | `1977.56` | `417.48` | `17.50` |
+| `whisper_turbo` | `827.48` | `188.29` | `41.83` |
+| `whisper_large_v3` | `480.65` | `100.12` | `72.01` |
+
+Oracle:
+
+- WER/CER: `0.0495542550` / `0.0224726917`
+- delta vs turbo: `-0.0325687220` WER, `-0.0165369951` CER
+- choices: turbo `5066`, large-v3 `798`, Parakeet TDT `792`
+
+Runtime/access notes:
+
+- `CohereLabs/cohere-transcribe-03-2026` is still gated for the current token, so it was not part of the full result.
+- `nvidia/parakeet-unified-en-0.6b` failed smoke with the current NeMo image due an incompatible `att_chunk_context_size` config field.
+- The bakeoff script records raw per-batch and per-sample timing inside worker result payloads, plus per-shard progress JSON. It now also writes backend-specific progress JSON for parallel backend groups.
+
+Read:
+
+- The best measured single model is now clearly `openai/whisper-large-v3`, not turbo and not any LoRA adapter.
+- Parakeet is much faster, but it is not close enough on Svarah WER/CER for the accent-quality objective.
+- The oracle result says routing still has real headroom, but the router must be quality-aware. A speed-first Parakeet route alone would hurt accuracy.
+- Data work should keep using large-v3 as teacher/verifier and stop trying to rescue broad Common Voice or Indic-TIMIT recipes without stronger evidence.
 
 ## Legacy full-run template
 
