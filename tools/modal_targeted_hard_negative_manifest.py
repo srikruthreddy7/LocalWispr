@@ -196,6 +196,7 @@ class TargetedConfig:
     max_samples_per_speaker: int = 40
     dedupe_text: bool = True
     reject_format_sensitive: bool = True
+    use_indian_context_terms: bool = False
 
 
 def _now_utc() -> str:
@@ -403,7 +404,7 @@ def _row_score(row: dict[str, Any], diff: dict[str, Any], source_label: str) -> 
         return False, 0.0, ["selection_score_too_low"]
 
     text_tokens = set(_tokens(text))
-    has_indian_context = bool(text_tokens & INDIAN_CONTEXT_TERMS)
+    has_indian_context = bool(CONFIG.use_indian_context_terms and text_tokens & INDIAN_CONTEXT_TERMS)
     tags = list(diff["tags"])
     if has_indian_context:
         tags.append("indian_context_term")
@@ -511,6 +512,7 @@ def targeted_manifest_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
         max_samples_per_speaker=int(config_payload.get("max_samples_per_speaker", 40)),
         dedupe_text=bool(config_payload.get("dedupe_text", True)),
         reject_format_sensitive=bool(config_payload.get("reject_format_sensitive", True)),
+        use_indian_context_terms=bool(config_payload.get("use_indian_context_terms", False)),
     )
     rng = random.Random(CONFIG.seed)
     run_id = f"{CONFIG.mix_name}-{_now_utc()}"
@@ -641,6 +643,7 @@ def targeted_manifest_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
             "max_samples_per_speaker": CONFIG.max_samples_per_speaker,
             "dedupe_text": CONFIG.dedupe_text,
             "reject_format_sensitive": CONFIG.reject_format_sensitive,
+            "use_indian_context_terms": CONFIG.use_indian_context_terms,
         },
         "sources": source_reports,
         "filters": {
@@ -693,6 +696,7 @@ def main(
     max_samples_per_speaker: int = 40,
     dedupe_text: bool = True,
     reject_format_sensitive: bool = True,
+    use_indian_context_terms: bool = False,
 ) -> None:
     report = targeted_manifest_remote.remote(
         {
@@ -710,6 +714,7 @@ def main(
             "max_samples_per_speaker": max_samples_per_speaker,
             "dedupe_text": dedupe_text,
             "reject_format_sensitive": reject_format_sensitive,
+            "use_indian_context_terms": use_indian_context_terms,
         }
     )
     print(json.dumps(report, indent=2, sort_keys=True))

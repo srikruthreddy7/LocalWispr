@@ -3925,8 +3925,9 @@ def _score_training_row(
     accent = str(row.get("accents") or row.get("accent") or "")
     language = str(row.get("language") or row.get("locale") or row.get("lang") or "")
     preset = quality_preset.strip().lower()
-    accent_required = preset in {"accent_safe", "accent_only"}
-    reject_format_sensitive = preset == "accent_only"
+    accent_required = preset in {"accent_safe", "accent_only", "reliable_accent"}
+    reject_format_sensitive = preset in {"accent_only", "reliable_accent"}
+    reliable_accent = preset == "reliable_accent"
 
     score = 100.0
     reject_reasons: list[str] = []
@@ -3947,6 +3948,11 @@ def _score_training_row(
         score += 8
 
     word_count = int(flags["word_count"])
+    if reliable_accent and duration_seconds is not None and duration_seconds < 1.5:
+        reject_reasons.append("reliable_accent_too_short_audio")
+    if reliable_accent and duration_seconds is not None and duration_seconds > 8.0:
+        reject_reasons.append("reliable_accent_too_long_audio")
+
     if word_count <= 2:
         score -= 8
         warnings.append("very_short_text")
@@ -3955,6 +3961,10 @@ def _score_training_row(
     elif word_count > 22:
         score -= 10
         warnings.append("long_text")
+    if reliable_accent and word_count < 4:
+        reject_reasons.append("reliable_accent_too_few_words")
+    if reliable_accent and word_count > 18:
+        reject_reasons.append("reliable_accent_too_many_words")
 
     if flags["contains_markup"]:
         score -= 10
@@ -3962,6 +3972,8 @@ def _score_training_row(
     if flags["non_ascii_ratio"] > 0.05:
         score -= 8
         warnings.append("high_non_ascii_ratio")
+        if reliable_accent:
+            reject_reasons.append("high_non_ascii_ratio")
     if flags["contains_digit"] or flags["contains_date_like"] or flags["contains_currency_or_amount"]:
         score -= 12
         warnings.append("format_sensitive_text")
@@ -3974,10 +3986,14 @@ def _score_training_row(
         elif up_votes < 2:
             score -= 10
             warnings.append("low_up_votes")
+            if reliable_accent:
+                reject_reasons.append("low_up_votes")
     if down_votes is not None and down_votes > 0:
         score -= min(30, down_votes * 10)
         warnings.append("downvoted")
-        if down_votes >= 3:
+        if reliable_accent:
+            reject_reasons.append("downvoted")
+        elif down_votes >= 3:
             reject_reasons.append("many_down_votes")
 
     if accent:

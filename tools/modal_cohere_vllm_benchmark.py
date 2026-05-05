@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -35,6 +35,10 @@ HF_CACHE_VOLUME_NAME = os.environ.get(
 )
 HF_SECRET_NAME = os.environ.get("LOCALWISPR_MODAL_LORA_HF_SECRET_NAME", "huggingface-secret")
 GPU = os.environ.get("LOCALWISPR_MODAL_LORA_TRAIN_GPU", "H100!")
+COHERE_BASE_MODEL = os.environ.get(
+    "LOCALWISPR_MODAL_COHERE_BASE_MODEL",
+    "CohereLabs/cohere-transcribe-03-2026",
+)
 
 ARTIFACTS_DIR = Path("/artifacts")
 HF_CACHE_DIR = Path("/cache/huggingface")
@@ -58,10 +62,10 @@ vllm_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("curl", "ffmpeg", "git", "libsndfile1", "wget")
     .pip_install("uv")
-    .run_commands('uv pip install --system -U "vllm[audio]==0.20.0"')
+    .run_commands('uv pip install --system -U "vllm[audio]==0.20.1"')
     .run_commands(
         'uv pip install --system "datasets[audio]" "httpx" "jiwer" "librosa" '
-        '"mistral-common[audio]>=1.8.1" "numpy" "requests" "soundfile" '
+        '"accelerate" "mistral-common[audio]>=1.8.1" "numpy" "peft" "requests" "soundfile" '
         '"transformers>=5.4.0" "websockets"'
     )
     .env(COMMON_ENV)
@@ -86,6 +90,7 @@ class BenchmarkConfig:
     language_code: str = "en"
     punctuation: bool = True
     concurrency: int = 16
+    request_max_attempts: int = 3
     request_timeout_seconds: float = 300.0
     port: int = 8000
     api_key: str = "localwispr-vllm"
@@ -101,6 +106,15 @@ class BenchmarkConfig:
     temperature: float = 0.0
     enable_lora: bool = False
     max_lora_rank: int = 64
+    cohere_processor_model_name: str = COHERE_BASE_MODEL
+    cohere_lora_adapter_run_id: str | None = None
+    cohere_lora_adapter_dir: str | None = None
+    cohere_merged_model_dir: str | None = None
+    cohere_merge_name: str = "cohere-merged-checkpoint"
+    cohere_merge_dtype: str = "bfloat16"
+    cohere_merge_max_shard_size: str = "5GB"
+    cohere_merge_safe_merge: bool = True
+    cohere_merged_validation_max_samples: int = 8
 
 
 def _now_iso() -> str:
@@ -151,6 +165,101 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     tmp_path.replace(path)
+
+
+def _resolve_artifact_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return ARTIFACTS_DIR / value.lstrip("/")
+
+
+def _ensure_artifact_output_path(path: Path) -> None:
+    try:
+        path.resolve().relative_to(ARTIFACTS_DIR.resolve())
+    except ValueError as exc:
+        raise ValueError(f"Merged checkpoint output must be under {ARTIFACTS_DIR}: {path}") from exc
+
+
+def _ensure_empty_output_dir(path: Path) -> None:
+    _ensure_artifact_output_path(path)
+    if path.exists() and not path.is_dir():
+        raise FileExistsError(f"Merged checkpoint output path exists and is not a directory: {path}")
+    if path.exists() and any(path.iterdir()):
+        raise FileExistsError(
+            f"Refusing to overwrite non-empty merged checkpoint directory: {path}. "
+            "Choose a new cohere_merged_model_dir or validate this directory without an adapter."
+        )
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _resolve_cohere_adapter_dir(config: BenchmarkConfig) -> Path:
+    if config.cohere_lora_adapter_dir:
+        adapter_dir = _resolve_artifact_path(config.cohere_lora_adapter_dir)
+    elif config.cohere_lora_adapter_run_id:
+        adapter_dir = ARTIFACTS_DIR / config.cohere_lora_adapter_run_id / "adapter"
+    else:
+        raise ValueError(
+            "Cohere LoRA merge requires cohere_lora_adapter_dir or cohere_lora_adapter_run_id."
+        )
+    if not (adapter_dir / "adapter_config.json").exists():
+        raise FileNotFoundError(f"PEFT adapter_config.json not found: {adapter_dir}")
+    return adapter_dir
+
+
+def _resolve_cohere_merged_model_dir(config: BenchmarkConfig, *, run_dir: Path) -> Path:
+    if config.cohere_merged_model_dir:
+        return _resolve_artifact_path(config.cohere_merged_model_dir)
+    return run_dir / "merged_model"
+
+
+def _torch_dtype_from_name(dtype_name: str) -> Any:
+    import torch
+
+    normalized = dtype_name.strip().lower()
+    if normalized in {"auto", ""}:
+        return "auto"
+    if normalized in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if normalized in {"fp16", "float16", "half"}:
+        return torch.float16
+    if normalized in {"fp32", "float32", "float"}:
+        return torch.float32
+    raise ValueError("cohere_merge_dtype must be one of: auto, bfloat16, float16, float32")
+
+
+def _save_cohere_pretrained_assets(
+    *,
+    base_model_name: str,
+    adapter_dir: Path,
+    merged_model_dir: Path,
+) -> list[str]:
+    from transformers import AutoProcessor, AutoTokenizer
+
+    saved: list[str] = []
+    for loader, label in ((AutoProcessor, "processor"), (AutoTokenizer, "tokenizer")):
+        last_error: Exception | None = None
+        for source in (adapter_dir, base_model_name):
+            try:
+                asset = loader.from_pretrained(source, trust_remote_code=True)
+                asset.save_pretrained(str(merged_model_dir))
+                saved.append(label)
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+        if last_error is not None:
+            print(f"[cohere-merge] could not save {label}: {last_error}", flush=True)
+    return saved
+
+
+def _validate_vllm_lora_config(config: BenchmarkConfig) -> None:
+    if config.enable_lora and _model_family(config) == "cohere_asr":
+        raise ValueError(
+            "Dynamic vLLM LoRA is unsupported for Cohere ASR in this benchmark. "
+            "Use mode='merge_cohere_lora' to create a full checkpoint, or "
+            "mode='validate_merged_cohere_lora' to run a bounded vLLM validation."
+        )
 
 
 def _append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -383,7 +492,7 @@ def _cohere_vllm_prompt(config: BenchmarkConfig) -> str:
 def _cohere_vllm_prompt_token_ids(config: BenchmarkConfig) -> list[int]:
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(_cohere_processor_source(config), trust_remote_code=True)
     punctuation_token = "<|pnc|>" if config.punctuation else "<|nopnc|>"
     prompt_tokens = [
         "▁",
@@ -404,6 +513,15 @@ def _cohere_vllm_prompt_token_ids(config: BenchmarkConfig) -> list[int]:
     if unk_token_id is not None and any(token_id == unk_token_id for token_id in token_ids):
         raise ValueError("Failed to resolve Cohere ASR decoder control tokens.")
     return [int(token_id) for token_id in token_ids]
+
+
+def _cohere_processor_source(config: BenchmarkConfig) -> str:
+    if _model_family(config) != "cohere_asr":
+        return config.model_name
+    model_path = Path(config.model_name)
+    if model_path.is_absolute() or str(config.model_name).startswith("/artifacts/"):
+        return config.cohere_processor_model_name or COHERE_BASE_MODEL
+    return config.model_name
 
 
 def _granite_prompt(config: BenchmarkConfig) -> str:
@@ -466,6 +584,8 @@ def _offline_engine_kwargs(config: BenchmarkConfig) -> dict[str, Any]:
         kwargs["max_lora_rank"] = config.max_lora_rank
     if family in {"cohere_asr", "generic_transcription"}:
         kwargs["trust_remote_code"] = True
+    if family == "cohere_asr":
+        kwargs["tokenizer"] = _cohere_processor_source(config)
     if family == "voxtral":
         kwargs.update(
             {
@@ -485,11 +605,14 @@ def _build_offline_inputs(
 ) -> list[dict[str, Any]]:
     family = _model_family(config)
     if family == "cohere_asr":
-        prompt_token_ids = _cohere_vllm_prompt_token_ids(config)
+        prompt = _cohere_vllm_prompt(config)
         return [
             {
-                "prompt_token_ids": prompt_token_ids,
-                "multi_modal_data": {"audio": [audio]},
+                "encoder_prompt": {
+                    "prompt_token_ids": [0],
+                    "multi_modal_data": {"audio": [audio]},
+                },
+                "decoder_prompt": prompt,
             }
             for audio in audios
         ]
@@ -550,6 +673,10 @@ def _start_vllm_server(config: BenchmarkConfig) -> tuple[subprocess.Popen[str], 
     ]
     if family in {"cohere_asr", "generic_transcription"}:
         command.append("--trust-remote-code")
+    if family == "cohere_asr":
+        tokenizer_name = _cohere_processor_source(config)
+        if tokenizer_name != config.model_name:
+            command.extend(["--tokenizer", tokenizer_name])
     if config.max_model_len:
         command.extend(["--max-model-len", str(config.max_model_len)])
     if family == "voxtral":
@@ -625,7 +752,6 @@ async def _transcribe_one(
     index: int,
 ) -> dict[str, Any]:
     url = f"http://127.0.0.1:{config.port}/v1/audio/transcriptions"
-    started = time.monotonic()
     audio_bytes = audio_path.read_bytes()
     data = {
         "model": config.model_name,
@@ -635,30 +761,45 @@ async def _transcribe_one(
     }
     if _model_family(config) == "cohere_asr":
         data["prompt"] = _cohere_vllm_prompt(config)
-    response = await client.post(
-        url,
-        headers={"Authorization": f"Bearer {config.api_key}"},
-        data=data,
-        files={"file": (audio_path.name, audio_bytes, "audio/wav")},
+    attempts = max(1, int(config.request_max_attempts))
+    last_error = ""
+    request_started = time.monotonic()
+    for attempt in range(1, attempts + 1):
+        started = time.monotonic()
+        try:
+            response = await client.post(
+                url,
+                headers={"Authorization": f"Bearer {config.api_key}"},
+                data=data,
+                files={"file": (audio_path.name, audio_bytes, "audio/wav")},
+            )
+            ended = time.monotonic()
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"status={response.status_code}: {response.text[:1000]}"
+                )
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {"text": response.text}
+            text = payload.get("text") if isinstance(payload, dict) else str(payload)
+            return {
+                "index": index,
+                "prediction": str(text or ""),
+                "request_seconds": ended - request_started,
+                "request_started": request_started,
+                "request_ended": ended,
+                "attempts": attempt,
+                "response": _json_safe(payload),
+            }
+        except Exception as exc:
+            last_error = f"{exc.__class__.__name__}: {exc}"
+            if attempt >= attempts:
+                break
+            await asyncio.sleep(min(2.0 * attempt, 10.0))
+    raise RuntimeError(
+        f"vLLM request index={index} failed after {attempts} attempts: {last_error}"
     )
-    ended = time.monotonic()
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"vLLM request index={index} failed status={response.status_code}: {response.text[:1000]}"
-        )
-    try:
-        payload = response.json()
-    except Exception:
-        payload = {"text": response.text}
-    text = payload.get("text") if isinstance(payload, dict) else str(payload)
-    return {
-        "index": index,
-        "prediction": str(text or ""),
-        "request_seconds": ended - started,
-        "request_started": started,
-        "request_ended": ended,
-        "response": _json_safe(payload),
-    }
 
 
 async def _transcribe_all(
@@ -923,6 +1064,264 @@ def _load_compare_report(run_id: str | None) -> dict[str, Any] | None:
         return None
 
 
+def _merge_cohere_lora_checkpoint_impl(config: BenchmarkConfig) -> dict[str, Any]:
+    import torch
+    from peft import PeftModel
+    from transformers import CohereAsrForConditionalGeneration
+
+    if _model_family(config) != "cohere_asr":
+        raise ValueError("Cohere LoRA merge requires model_family='cohere_asr' or a Cohere model_name.")
+
+    adapter_dir = _resolve_cohere_adapter_dir(config)
+    run_id = f"{_sanitize_artifact_component(config.cohere_merge_name)}-{_now_utc()}"
+    run_dir = _run_dir(run_id)
+    progress_path = run_dir / "progress.json"
+    merged_model_dir = _resolve_cohere_merged_model_dir(config, run_dir=run_dir)
+    _ensure_empty_output_dir(merged_model_dir)
+
+    _write_json(
+        progress_path,
+        {
+            "stage": "merge_cohere_lora",
+            "status": "loading_base_model",
+            "updated_at_utc": _now_iso(),
+            "run_id": run_id,
+            "base_model": config.model_name,
+            "adapter_dir": str(adapter_dir),
+            "merged_model_dir": str(merged_model_dir),
+        },
+    )
+    artifacts_volume.commit()
+
+    token = _get_hf_token()
+    if token:
+        os.environ["HF_TOKEN"] = token
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = token
+
+    load_kwargs: dict[str, Any] = {
+        "torch_dtype": _torch_dtype_from_name(config.cohere_merge_dtype),
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+    }
+    if torch.cuda.is_available():
+        load_kwargs["device_map"] = "auto"
+
+    started = time.monotonic()
+    base_model = CohereAsrForConditionalGeneration.from_pretrained(
+        config.model_name,
+        token=token,
+        **load_kwargs,
+    )
+    base_load_seconds = time.monotonic() - started
+
+    _write_json(
+        progress_path,
+        {
+            "stage": "merge_cohere_lora",
+            "status": "loading_adapter",
+            "updated_at_utc": _now_iso(),
+            "run_id": run_id,
+            "base_load_seconds": base_load_seconds,
+        },
+    )
+    artifacts_volume.commit()
+
+    adapter_load_started = time.monotonic()
+    peft_model = PeftModel.from_pretrained(base_model, str(adapter_dir))
+    adapter_load_seconds = time.monotonic() - adapter_load_started
+
+    _write_json(
+        progress_path,
+        {
+            "stage": "merge_cohere_lora",
+            "status": "merging",
+            "updated_at_utc": _now_iso(),
+            "run_id": run_id,
+            "safe_merge": config.cohere_merge_safe_merge,
+        },
+    )
+    artifacts_volume.commit()
+
+    merge_started = time.monotonic()
+    try:
+        merged_model = peft_model.merge_and_unload(safe_merge=config.cohere_merge_safe_merge)
+    except TypeError as exc:
+        if config.cohere_merge_safe_merge:
+            raise RuntimeError(
+                "Installed PEFT does not support safe_merge=True for merge_and_unload."
+            ) from exc
+        merged_model = peft_model.merge_and_unload()
+    merge_seconds = time.monotonic() - merge_started
+
+    _write_json(
+        progress_path,
+        {
+            "stage": "merge_cohere_lora",
+            "status": "saving",
+            "updated_at_utc": _now_iso(),
+            "run_id": run_id,
+            "merge_seconds": merge_seconds,
+        },
+    )
+    artifacts_volume.commit()
+
+    save_started = time.monotonic()
+    from safetensors.torch import save_file as save_safetensors_file
+    from safetensors.torch import load_file as load_safetensors_file
+    from huggingface_hub import snapshot_download
+
+    merged_state_dict = merged_model.state_dict()
+    base_snapshot_dir = Path(
+        snapshot_download(
+            config.model_name,
+            token=token,
+            allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
+        )
+    )
+    base_checkpoint_state: dict[str, Any] = {}
+    for shard_path in sorted(base_snapshot_dir.glob("*.safetensors")):
+        base_checkpoint_state.update(load_safetensors_file(str(shard_path)))
+    if not base_checkpoint_state:
+        raise RuntimeError(f"No base safetensors checkpoint shards found in {base_snapshot_dir}")
+    base_checkpoint_keys = set(base_checkpoint_state)
+    merged_extra_keys_removed = sorted(set(merged_state_dict) - base_checkpoint_keys)
+    base_keys_reused = sorted(base_checkpoint_keys - set(merged_state_dict))
+    vllm_state_dict = {
+        key: merged_state_dict.get(key, base_value)
+        for key, base_value in base_checkpoint_state.items()
+    }
+    merged_model.config.save_pretrained(str(merged_model_dir))
+    if getattr(merged_model, "generation_config", None) is not None:
+        merged_model.generation_config.save_pretrained(str(merged_model_dir))
+    save_safetensors_file(
+        {
+            key: value.detach().cpu().contiguous()
+            for key, value in vllm_state_dict.items()
+        },
+        str(merged_model_dir / "model.safetensors"),
+        metadata={"format": "pt"},
+    )
+    saved_assets = _save_cohere_pretrained_assets(
+        base_model_name=config.model_name,
+        adapter_dir=adapter_dir,
+        merged_model_dir=merged_model_dir,
+    )
+    save_seconds = time.monotonic() - save_started
+
+    required_files = ["config.json"]
+    missing_files = [name for name in required_files if not (merged_model_dir / name).exists()]
+    if not any(merged_model_dir.glob("*.safetensors")) and not any(merged_model_dir.glob("*.bin")):
+        missing_files.append("model weights")
+    if missing_files:
+        raise RuntimeError(
+            f"Merged checkpoint save is incomplete at {merged_model_dir}; missing {missing_files}"
+        )
+
+    report = {
+        "run_id": run_id,
+        "created_at_utc": _now_iso(),
+        "base_model": config.model_name,
+        "model_family": _model_family(config),
+        "adapter_dir": str(adapter_dir),
+        "merged_model_dir": str(merged_model_dir),
+        "vllm_model_name": str(merged_model_dir),
+        "merge": {
+            "dtype": config.cohere_merge_dtype,
+            "safe_merge": config.cohere_merge_safe_merge,
+            "max_shard_size": config.cohere_merge_max_shard_size,
+            "saved_assets": saved_assets,
+            "base_checkpoint_keys": len(base_checkpoint_keys),
+            "merged_extra_keys_removed": merged_extra_keys_removed,
+            "base_keys_reused": base_keys_reused,
+        },
+        "timing": {
+            "base_load_seconds": base_load_seconds,
+            "adapter_load_seconds": adapter_load_seconds,
+            "merge_seconds": merge_seconds,
+            "save_seconds": save_seconds,
+            "total_seconds": time.monotonic() - started,
+        },
+        "artifacts": {
+            "run_dir": str(run_dir),
+            "report_path": str(run_dir / "report.json"),
+            "progress_path": str(progress_path),
+            "merged_model_dir": str(merged_model_dir),
+        },
+    }
+    _write_json(run_dir / "report.json", report)
+    _write_json(
+        progress_path,
+        {
+            "stage": "merge_cohere_lora",
+            "status": "complete",
+            "updated_at_utc": _now_iso(),
+            "run_id": run_id,
+            "report_path": str(run_dir / "report.json"),
+            "merged_model_dir": str(merged_model_dir),
+        },
+    )
+    artifacts_volume.commit()
+    hf_cache_volume.commit()
+
+    del peft_model
+    del base_model
+    del merged_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return report
+
+
+def _cohere_merged_validation_model_dir(config: BenchmarkConfig) -> tuple[Path, dict[str, Any] | None]:
+    has_adapter = bool(config.cohere_lora_adapter_dir or config.cohere_lora_adapter_run_id)
+    if has_adapter:
+        merge_report = _merge_cohere_lora_checkpoint_impl(config)
+        return Path(merge_report["merged_model_dir"]), merge_report
+    if not config.cohere_merged_model_dir:
+        raise ValueError(
+            "Merged Cohere validation requires an adapter to merge or cohere_merged_model_dir."
+        )
+    merged_model_dir = _resolve_artifact_path(config.cohere_merged_model_dir)
+    if not (merged_model_dir / "config.json").exists():
+        raise FileNotFoundError(f"Merged checkpoint config.json not found: {merged_model_dir}")
+    return merged_model_dir, None
+
+
+def _cohere_merged_validation_config(config: BenchmarkConfig, *, merged_model_dir: Path) -> BenchmarkConfig:
+    requested_samples = config.max_samples
+    validation_limit = max(1, int(config.cohere_merged_validation_max_samples or 1))
+    if requested_samples is None:
+        bounded_samples = validation_limit
+    else:
+        bounded_samples = max(1, min(int(requested_samples), validation_limit))
+    label = config.model_label or f"{_model_label(config)}-merged"
+    return replace(
+        config,
+        benchmark_name=f"{config.benchmark_name}-merged-validation",
+        model_name=str(merged_model_dir),
+        model_label=label,
+        model_family="cohere_asr",
+        max_samples=bounded_samples,
+        enable_lora=False,
+        cohere_lora_adapter_run_id=None,
+        cohere_lora_adapter_dir=None,
+        cohere_merged_model_dir=str(merged_model_dir),
+    )
+
+
+def _cohere_merged_vllm_validation_impl(config: BenchmarkConfig) -> dict[str, Any]:
+    merged_model_dir, merge_report = _cohere_merged_validation_model_dir(config)
+    validation_config = _cohere_merged_validation_config(config, merged_model_dir=merged_model_dir)
+    validation_report = _benchmark_impl(validation_config)
+    return {
+        "created_at_utc": _now_iso(),
+        "mode": "validate_merged_cohere_lora",
+        "merged_model_dir": str(merged_model_dir),
+        "bounded_max_samples": validation_config.max_samples,
+        "merge_report": merge_report,
+        "validation_report": validation_report,
+    }
+
+
 def _benchmark_offline_impl(
     *,
     config: BenchmarkConfig,
@@ -1161,6 +1560,7 @@ def _finalize_report(
 
 
 def _benchmark_impl(config: BenchmarkConfig) -> dict[str, Any]:
+    _validate_vllm_lora_config(config)
     token = _get_hf_token()
     run_id = f"{_sanitize_artifact_component(config.benchmark_name)}-{_now_utc()}"
     run_dir = _run_dir(run_id)
@@ -1342,8 +1742,41 @@ def cohere_vllm_benchmark_remote(payload: dict[str, Any]) -> dict[str, Any]:
     return _benchmark_impl(config)
 
 
+@app.function(
+    image=vllm_image,
+    gpu=GPU,
+    timeout=60 * 60 * 4,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={
+        str(ARTIFACTS_DIR): artifacts_volume,
+        str(HF_CACHE_DIR): hf_cache_volume,
+    },
+)
+def cohere_lora_merge_checkpoint_remote(payload: dict[str, Any]) -> dict[str, Any]:
+    os.environ["MODAL_GPU_LABEL"] = GPU
+    config = BenchmarkConfig(**payload)
+    return _merge_cohere_lora_checkpoint_impl(config)
+
+
+@app.function(
+    image=vllm_image,
+    gpu=GPU,
+    timeout=60 * 60 * 4,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={
+        str(ARTIFACTS_DIR): artifacts_volume,
+        str(HF_CACHE_DIR): hf_cache_volume,
+    },
+)
+def cohere_merged_vllm_validation_remote(payload: dict[str, Any]) -> dict[str, Any]:
+    os.environ["MODAL_GPU_LABEL"] = GPU
+    config = BenchmarkConfig(**payload)
+    return _cohere_merged_vllm_validation_impl(config)
+
+
 @app.local_entrypoint()
 def main(
+    mode: str = "benchmark",
     benchmark_name: str = "cohere-vllm-benchmark",
     model_name: str = "CohereLabs/cohere-transcribe-03-2026",
     model_label: str = "",
@@ -1358,6 +1791,7 @@ def main(
     language_code: str = "en",
     punctuation: bool = True,
     concurrency: int = 16,
+    request_max_attempts: int = 3,
     request_timeout_seconds: float = 300.0,
     port: int = 8000,
     max_num_seqs: int = 64,
@@ -1372,6 +1806,14 @@ def main(
     temperature: float = 0.0,
     enable_lora: bool = False,
     max_lora_rank: int = 64,
+    cohere_lora_adapter_run_id: str = "",
+    cohere_lora_adapter_dir: str = "",
+    cohere_merged_model_dir: str = "",
+    cohere_merge_name: str = "cohere-merged-checkpoint",
+    cohere_merge_dtype: str = "bfloat16",
+    cohere_merge_max_shard_size: str = "5GB",
+    cohere_merge_safe_merge: bool = True,
+    cohere_merged_validation_max_samples: int = 8,
 ) -> None:
     config = BenchmarkConfig(
         benchmark_name=benchmark_name,
@@ -1388,6 +1830,7 @@ def main(
         language_code=language_code,
         punctuation=punctuation,
         concurrency=concurrency,
+        request_max_attempts=request_max_attempts,
         request_timeout_seconds=request_timeout_seconds,
         port=port,
         max_num_seqs=max_num_seqs,
@@ -1402,6 +1845,33 @@ def main(
         temperature=temperature,
         enable_lora=enable_lora,
         max_lora_rank=max_lora_rank,
+        cohere_lora_adapter_run_id=cohere_lora_adapter_run_id or None,
+        cohere_lora_adapter_dir=cohere_lora_adapter_dir or None,
+        cohere_merged_model_dir=cohere_merged_model_dir or None,
+        cohere_merge_name=cohere_merge_name,
+        cohere_merge_dtype=cohere_merge_dtype,
+        cohere_merge_max_shard_size=cohere_merge_max_shard_size,
+        cohere_merge_safe_merge=cohere_merge_safe_merge,
+        cohere_merged_validation_max_samples=cohere_merged_validation_max_samples,
     )
-    report = cohere_vllm_benchmark_remote.remote(asdict(config))
+    mode_key = mode.strip().lower()
+    if mode_key == "benchmark" and (
+        config.cohere_lora_adapter_run_id
+        or config.cohere_lora_adapter_dir
+        or config.cohere_merged_model_dir
+    ):
+        raise ValueError(
+            "Cohere merge inputs are ignored by benchmark mode. Use mode='merge_cohere_lora', "
+            "mode='validate_merged_cohere_lora', or set model_name directly to a merged checkpoint."
+        )
+    if mode_key == "benchmark":
+        report = cohere_vllm_benchmark_remote.remote(asdict(config))
+    elif mode_key == "merge_cohere_lora":
+        report = cohere_lora_merge_checkpoint_remote.remote(asdict(config))
+    elif mode_key == "validate_merged_cohere_lora":
+        report = cohere_merged_vllm_validation_remote.remote(asdict(config))
+    else:
+        raise ValueError(
+            "mode must be one of: benchmark, merge_cohere_lora, validate_merged_cohere_lora"
+        )
     print(json.dumps(report, indent=2, sort_keys=True))

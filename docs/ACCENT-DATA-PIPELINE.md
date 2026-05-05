@@ -1671,6 +1671,368 @@ Final May 1 decision:
 - Voxtral Mini 4B Realtime is cheap and runnable on L40S, but its script/language behavior makes it unsuitable for this Indian-accent English benchmark right now.
 - Do not start more Whisper LoRA runs until the next experiment has a new signal: confidence/logprob routing, merged Cohere proof, or a better non-Svarah data source.
 
+## May 4 Cohere LoRA proof
+
+Goal: test whether the non-Svarah data lessons from the Whisper LoRA work transfer to Cohere Transcribe.
+
+The experiment stayed aligned with the same rule as the Whisper work: train and choose using non-Svarah data, then use Svarah only as a final external check.
+
+New tooling:
+
+- `tools/modal_cohere_lora_experiment.py`
+  - trains bounded Cohere ASR LoRA runs on Modal with HF Transformers, PEFT, Accelerate, BF16, and H100
+  - supports `print_config`, `inspect`, `smoke`, and `train_lora`
+  - keeps large runs behind an explicit `allow_large_run` guard
+  - uses generic PEFT LoRA config instead of PEFT `SEQ_2_SEQ_LM`, because the task-specific wrapper injected text-style `input_ids` into Cohere ASR
+- `tools/modal_asr_bakeoff.py`
+  - added backend `cohere_transformers_peft`
+  - resolves a Cohere adapter run id to `/artifacts/{run_id}/adapter`
+  - loads the base model from `adapter_config.json` when available
+  - compares base Cohere Transformers and PEFT adapter inference on the same shards
+- `tools/modal_cohere_vllm_benchmark.py`
+  - added `merge_cohere_lora` and `validate_merged_cohere_lora`
+  - filters the merged checkpoint to the exact upstream base safetensors key set before saving
+  - passes the original Cohere tokenizer/processor when loading a local merged checkpoint in vLLM
+- `tools/modal_vllm_cohere_probe.py`
+  - probes the installed vLLM Cohere ASR source and renderer path on Modal
+  - was used to confirm the current Cohere placeholder contract in vLLM `0.20.1`
+
+Training recipe:
+
+- run id: `cohere-accent-smoke-encoder-lora-v1-20260504-170754`
+- base model: `CohereLabs/cohere-transcribe-03-2026`
+- training manifest: `/artifacts/cohere-accent-smoke-v1-20260504-165515/train.jsonl`
+- rows: `1,016`
+- source mix:
+  - Common Voice clean: `508`
+  - Common Voice hard: `127`
+  - Vaani balanced: `254`
+  - Vaani hard: `95`
+  - Indic-TIMIT preserve: `32`
+- internal split: `914` train rows, `102` validation rows
+- max steps: `120`
+- batch: `4`, grad accumulation `2`
+- LoRA: encoder attention, rank `16`, alpha `32`, dropout `0.05`
+- optimizer LR: `5e-5`
+- dtype: BF16
+- trainable parameters: `7,864,320 / 2,075,609,344` (`0.003789`)
+- training runtime: `405.0098s`
+- total wall time: `449.6454s`
+- train loss: `1.6138590877`
+- eval loss: `0.7856663465`
+- adapter: `/artifacts/cohere-accent-smoke-encoder-lora-v1-20260504-170754/adapter`
+- processor: `/artifacts/cohere-accent-smoke-encoder-lora-v1-20260504-170754/processor`
+- report: `/artifacts/cohere-accent-smoke-encoder-lora-v1-20260504-170754/report.json`
+
+vLLM merged-checkpoint result:
+
+- The adapter can be merged into a full Cohere checkpoint.
+- The merged checkpoint became vLLM-loadable after saving only the exact expected upstream base keys.
+- The local merged checkpoint path observed in validation was `/artifacts/cohere-merged-checkpoint-20260504-173455/merged_model`.
+- Dynamic vLLM LoRA remains unsupported for Cohere ASR; the merge path is still the only plausible vLLM-speed path.
+- The current merged-checkpoint validation attempts are blocked in both vLLM `0.20.0` and `0.20.1` before generation.
+- The failure also reproduces in current base-control attempts using the same invocation shape, so it is not caused by the adapter merge.
+- This does not invalidate the earlier May 1 known-good base Cohere vLLM token-prompt run; it means the merged/local-checkpoint path is not proven yet.
+- Failure:
+
+```text
+RuntimeError: Expected there to be 1 prompt placeholders corresponding to 1 audio items, but instead found 0 prompt placeholders!
+```
+
+Source probe finding:
+
+- Installed vLLM `0.20.1` has `CohereASRMultiModalProcessor`.
+- Its Cohere ASR processor creates an encoder prompt from dummy token id `[0]`.
+- Its replacement rule expects that `[0]` placeholder to expand to the required audio tokens.
+- Explicit offline prompts with `encoder_prompt: {"prompt_token_ids": [0], "multi_modal_data": {"audio": [...]}}` still hit the placeholder error in the current vLLM renderer/preprocess path.
+- `VLLM_USE_V1=0` is not a valid current vLLM control knob; vLLM reports it as unknown, so it should not be used as a fallback.
+- Read: do not claim "Cohere LoRA + vLLM speed" until the merged-checkpoint vLLM invocation is fixed or a known-good local-checkpoint path appears upstream.
+
+Transformers/PEFT evaluation:
+
+| Run | Scope | Base WER | Base CER | LoRA WER | LoRA CER | Delta WER | Delta CER |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `cohere-lora-transformers-svarah-smoke-v2-20260504-191037` | first `64` Svarah rows | `0.0599022005` | `0.0335570470` | `0.0574572127` | `0.0331240528` | `-0.0024449878` | `-0.0004329942` |
+| `cohere-lora-transformers-svarah-full-v1-20260504-191347` | full Svarah, `6,656` rows | `0.0936851595` | `0.0498969497` | `0.0938854943` | `0.0504894889` | `+0.0002003348` | `+0.0005925392` |
+
+Full Svarah timing:
+
+| Model | Single-GPU equivalent RTFx | Parallel RTFx |
+| --- | ---: | ---: |
+| Cohere base Transformers | `117.6553` | `561.0585` |
+| Cohere PEFT LoRA Transformers | `87.8549` | `425.4213` |
+
+Full Svarah oracle:
+
+- oracle WER/CER: `0.0910664969` / `0.0484593982`
+- oracle chose base: `6,498`
+- oracle chose LoRA: `158`
+
+Read:
+
+- The 64-row smoke win did not survive full Svarah.
+- This adapter should not be promoted; on full Svarah it loses slightly to base Cohere.
+- The oracle shows there is some row-level headroom, but the fixed adapter only helps a small minority of rows.
+- This matches the main Whisper lesson: small heldout or smoke wins are not enough, and a fixed LoRA adapter can move the wrong examples unless selection is validated on stronger non-Svarah gates.
+- Cohere PEFT inference is slower than base Transformers, and the current vLLM merged-checkpoint path is blocked by Cohere ASR placeholder handling.
+- The next Cohere run needs a stronger non-Svarah gate before touching Svarah again. It should either:
+  - increase data quality and diversity before training,
+  - use base-KL preservation or distillation to reduce regressions,
+  - train a smaller/safer adapter and select scale on non-Svarah gates,
+  - or learn a confidence/router signal from non-Svarah pairwise predictions instead of serving a fixed adapter everywhere.
+
+## May 4 fail-closed data and validation gate
+
+The next change is procedural and enforced in code: no more "train, smoke, hope" loops. A candidate now needs to pass a non-Svarah promotion gate before Svarah is run.
+
+New validation tool:
+
+- `tools/modal_accent_validation_gate.py`
+  - reads Modal artifact `pairwise_predictions.jsonl`
+  - supports both nested Whisper adapter rows and flat bakeoff rows
+  - recomputes WER/CER edit ops from normalized text instead of trusting stored per-row metrics
+  - reports overall, per-run, per-source, and bucketed regressions
+  - fails closed if a candidate does not beat base overall or regresses a non-Svarah gate beyond budget
+
+Default promotion rules:
+
+- total usable rows must be at least `500`
+- each gate run must have at least `50` usable rows
+- candidate must improve overall WER by at least `0.00025`
+- candidate must not regress overall CER
+- each non-Svarah run must not regress WER
+- each non-Svarah run has only `0.00025` CER regression budget
+- source buckets with at least `50` rows get their own WER/CER regression budgets
+- WER and CER worsened/improved row ratios must stay at or below `1.0`
+- artifacts whose dataset/source metadata matches `svarah` are rejected by default
+
+Example for nested Whisper adapter artifacts:
+
+```bash
+modal run tools/modal_accent_validation_gate.py \
+  --gate-name non-svarah-promotion-vaani-cvlight-lr5-scale05-v1 \
+  --run-ids cv-gate-run-id,vaani-gate-run-id,indic-gate-run-id \
+  --candidate-labels 'vaani_cvlight_lr5@0.5' \
+  --baseline-label base
+```
+
+Example for flat bakeoff artifacts:
+
+```bash
+modal run tools/modal_accent_validation_gate.py \
+  --gate-name non-svarah-promotion-cohere-lora-v1 \
+  --run-ids cohere-nonsvarah-bakeoff-run-id \
+  --baseline-label cohere_base \
+  --candidate-labels cohere_lora
+```
+
+New data-selection controls:
+
+- `tools/modal_mix_training_manifests.py` now supports score-based source selection and hard filters:
+  - `--selection-strategy score`
+  - `--min-selection-score`
+  - `--min-base-cer`, `--max-base-cer`
+  - `--max-teacher-cer`
+  - `--min-duration-seconds`, `--max-duration-seconds`
+  - `--min-word-count`, `--max-word-count`
+  - `--reject-format-sensitive`
+- `tools/modal_whisper_lora_experiment.py` now has quality preset `reliable_accent` for clean anchor/audit manifests:
+  - requires Indian/South-Asian English metadata when available
+  - rejects digit/date/currency rows
+  - rejects high non-ASCII ratio
+  - rejects Common Voice rows with any downvotes
+  - rejects Common Voice rows with fewer than two upvotes when vote metadata exists
+  - keeps duration roughly `1.5-8s` and word count roughly `4-18`
+- `tools/modal_targeted_hard_negative_manifest.py` no longer uses Svarah-derived Indian context terms by default. The old boost remains behind `--use-indian-context-terms`, but the production selector should leave it off.
+
+Example score-based reliable mix:
+
+```bash
+modal run tools/modal_mix_training_manifests.py \
+  --mix-name cohere-reliable-accent-mix-v1 \
+  --sources /artifacts/hard-mine-cv/train.jsonl:512:cv_hard,/artifacts/hard-mine-vaani/train.jsonl:512:vaani_hard,/artifacts/indic-preserve/train.jsonl:256:indic_preserve \
+  --selection-strategy score \
+  --min-selection-score 0.03 \
+  --min-base-cer 0.04 \
+  --max-base-cer 0.35 \
+  --max-teacher-cer 0.02 \
+  --min-duration-seconds 1.5 \
+  --max-duration-seconds 8.0 \
+  --min-word-count 4 \
+  --max-word-count 18 \
+  --reject-format-sensitive \
+  --max-samples-per-speaker 8
+```
+
+Read:
+
+- This does not guarantee LoRA will win. It prevents us from promoting weak adapters based on smoke noise.
+- The next Cohere training attempt should use a manifest built through the new score/quality filters, then run non-Svarah gates through `modal_accent_validation_gate.py`.
+- Svarah remains final-only. If the non-Svarah gate fails, Svarah should not be run.
+
+Gate smoke on the old non-Svarah-selected Whisper candidate:
+
+- run id: `non-svarah-promotion-sourcebalance-vaani-cvlight-lr5-scale05-smoke-20260504-194718`
+- candidate: `vaani_cvlight_lr5@0.5`
+- gates:
+  - `nonsvarah-sweep-cvheldout-sourcebalance-v1-20260430-150706`
+  - `nonsvarah-sweep-vaani-sourcebalance-v1-20260430-151231`
+  - `nonsvarah-sweep-indictimit-sourcebalance-4096-v1-20260430-150721`
+- rows loaded: `6,331`
+- overall base WER/CER: `0.0803307547` / `0.0370763665`
+- overall candidate WER/CER: `0.0799754518` / `0.0367943941`
+- overall delta WER/CER: `-0.0003553029` / `-0.0002819724`
+- decision: failed
+- failure: Indic-TIMIT gate regressed WER by `+0.0002987263`
+
+Read:
+
+- The old candidate looked good overall, but the stricter gate caught a source-specific regression.
+- This is the right behavior. The next model should not go to Svarah just because aggregate non-Svarah WER improved.
+
+## May 5 Qwen and Canary ASR bakeoff
+
+Goal: test newer open ASR candidates for the Indian-accent English objective, with full Svarah metrics and enough speed instrumentation to decide whether they are practical replacements for Whisper or Cohere.
+
+Models tested:
+
+- `Qwen/Qwen3-ASR-1.7B`
+- `nvidia/canary-qwen-2.5b`
+
+New tooling:
+
+- `tools/modal_cohere_vllm_benchmark.py`
+  - added retry support for vLLM HTTP transcription requests via `request_max_attempts`
+  - keeps failed request errors as built-in `RuntimeError`s so Modal can serialize them cleanly
+- `tools/modal_asr_bakeoff.py`
+  - added backend `nemo_salm` for NeMo SpeechLM2 SALM models such as Canary-Qwen
+  - added NeMo SALM model prefetch before multi-worker launch so parallel workers do not corrupt or race on checkpoint restore
+  - added a dedicated `nemo_salm_image` using NeMo trunk, then force-pinning compatible CUDA `torch`, `torchaudio`, and `torchcodec`
+  - supports full 5-GPU sharding for `nemo_salm` models with per-shard progress logs
+
+Runtime fixes discovered:
+
+- Qwen vLLM at `concurrency=128` caused local HTTP read failures against the vLLM audio endpoint.
+- The successful Qwen run used `concurrency=48`, `max_num_seqs=48`, `request_timeout_seconds=600`, and `request_max_attempts=4`.
+- Canary-Qwen cannot be loaded through the older `nemo.collections.asr.models.ASRModel.from_pretrained` path; it needs `nemo.collections.speechlm2.models.SALM`.
+- The NeMo SALM image initially failed because generic package resolution mixed CUDA 13 `torchaudio` with CUDA 12.9 `torch`.
+- The stable image pins:
+  - `torch==2.9.1+cu129`
+  - `torchaudio==2.9.1+cu129`
+  - `torchcodec==0.9.0`
+- The first Canary data-decode run also exposed that `torchcodec==0.11.1` is incompatible with `torch==2.9.1+cu129`; pinning `torchcodec==0.9.0` fixed it.
+
+### Qwen3-ASR-1.7B via vLLM
+
+Successful full run:
+
+- run id: `qwen3-asr-1p7b-svarah-full-v2-20260505-205128`
+- model: `Qwen/Qwen3-ASR-1.7B`
+- backend: vLLM OpenAI-compatible audio transcription server
+- GPU: `H100!`
+- dataset: full `ai4bharat/Svarah` test split
+- samples: `6,656`
+- audio seconds: `34,611.9977`
+- concurrency: `48`
+- max vLLM sequences: `48`
+
+Metrics:
+
+| Model | WER | CER |
+| --- | ---: | ---: |
+| Qwen3-ASR-1.7B vLLM | `0.1794570926` | `0.1053560387` |
+
+Timing:
+
+| Metric | Value |
+| --- | ---: |
+| Server ready | `152.3297s` |
+| Request wall time | `67.9978s` |
+| Full end-to-end wall time | `254.6126s` |
+| Request throughput RTFx | `509.0165` |
+| End-to-end RTFx | `135.9398` |
+| Mean request latency | `0.4877s` |
+| p95 request latency | `0.9280s` |
+| p99 request latency | `1.4587s` |
+
+Read:
+
+- Qwen3-ASR is fast enough to serve through vLLM, but the full Svarah accuracy is not competitive.
+- It loses badly to Whisper, Cohere, and Canary-Qwen on Indian-accent English WER/CER.
+- Do not continue with Qwen3-ASR for this objective unless a much better prompt/decoding path appears.
+
+### Canary-Qwen-2.5B through NeMo SALM
+
+Smoke run after runtime fixes:
+
+- run id: `canary-qwen-2p5b-svarah-smoke-v5-20260505-210656`
+- samples: first `20` Svarah rows
+- GPU split: `H100!:5`
+- WER/CER: `0.0641711230` / `0.0309777348`
+- parallel RTFx: `60.1402`
+- single-GPU equivalent RTFx: `15.2140`
+
+Successful full run:
+
+- run id: `canary-qwen-2p5b-svarah-full-v5-20260505-210926`
+- model: `nvidia/canary-qwen-2.5b`
+- backend: NeMo SpeechLM2 SALM
+- GPU split: `H100!:5`
+- dataset: full `ai4bharat/Svarah` test split
+- samples: `6,656`
+- audio seconds: `34,611.9977`
+- per-device eval batch size: `16`
+- max new tokens: `128`
+
+Metrics:
+
+| Model | WER | CER |
+| --- | ---: | ---: |
+| Canary-Qwen-2.5B NeMo SALM | `0.1054047479` | `0.0564380668` |
+
+Timing:
+
+| Metric | Value |
+| --- | ---: |
+| Max dataset load | `3.1270s` |
+| Max model load | `37.6614s` |
+| Parallel inference seconds | `99.1311s` |
+| Max worker wall seconds | `233.8599s` |
+| Parallel RTFx | `349.1538` |
+| Single-GPU equivalent RTFx | `71.7604` |
+| Mean amortized sample latency | `0.0725s` |
+| p95 amortized sample latency | `0.1223s` |
+| p99 amortized sample latency | `0.1483s` |
+
+Read:
+
+- Canary-Qwen is materially more accurate than Qwen3-ASR on Svarah, and the 5-GPU NeMo path works.
+- It still loses clearly to Cohere vLLM, Whisper turbo, and Whisper large-v3 on Indian-accent English accuracy.
+- Its speed is practical for batch evaluation, but it is not the best production candidate from the current evidence.
+
+### Current full-Svarah ranking
+
+All rows below are full `ai4bharat/Svarah` test split measurements unless marked as an adapter variant.
+
+| Rank | Model | WER | CER | Speed read |
+| ---: | --- | ---: | ---: | --- |
+| 1 | `openai/whisper-large-v3` | `0.0711331797` | `0.0343750000` | best accuracy, slower than turbo |
+| 2 | `openai/whisper-large-v3-turbo` | `0.0821229770` | `0.0390096867` | best Whisper speed baseline |
+| 3 | best non-Svarah-selected Whisper LoRA | `0.0814647339` | `0.0386206719` | tiny win over turbo, not a large win |
+| 4 | `CohereLabs/cohere-transcribe-03-2026` via vLLM | `0.0932844898` | `0.0496856966` | best measured non-Whisper speed/quality tradeoff |
+| 5 | Cohere encoder LoRA through Transformers | `0.0938854943` | `0.0504894889` | worse than base Cohere |
+| 6 | `nvidia/canary-qwen-2.5b` through NeMo SALM | `0.1054047479` | `0.0564380668` | batch-fast with 5 GPUs, accuracy behind Cohere |
+| 7 | `nvidia/parakeet-tdt-0.6b-v2` | `0.1306326288` | `0.0742090890` | very fast, accuracy weak |
+| 8 | `Qwen/Qwen3-ASR-1.7B` via vLLM | `0.1794570926` | `0.1053560387` | fast, accuracy not viable |
+
+Final May 5 decision:
+
+- For Indian-accent accuracy, `openai/whisper-large-v3` remains the best measured single model.
+- For single-GPU speed among non-Whisper candidates, base Cohere through vLLM remains the strongest practical candidate, but its WER/CER are still worse than Whisper turbo.
+- Canary-Qwen is worth keeping in the bakeoff harness because the SALM path now works, but it is not a replacement for Whisper or Cohere on current Svarah accuracy.
+- Qwen3-ASR should be deprioritized for this objective.
+- More LoRA work should not be promoted from smoke wins. Use the fail-closed non-Svarah promotion gate first, then run Svarah only as a final check.
+
 ## Sources
 
 - [ishands/commonvoice-indian_accent](https://huggingface.co/datasets/ishands/commonvoice-indian_accent)
@@ -1695,3 +2057,5 @@ Final May 1 decision:
 - [vLLM realtime speech-to-text example](https://docs.vllm.ai/en/latest/examples/speech_to_text/realtime/)
 - [Voxtral Mini 4B Realtime model card](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602)
 - [Voxtral Small 24B model card](https://huggingface.co/mistralai/Voxtral-Small-24B-2507)
+- [Qwen3-ASR-1.7B model card](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)
+- [Canary-Qwen-2.5B model card](https://huggingface.co/nvidia/canary-qwen-2.5b)

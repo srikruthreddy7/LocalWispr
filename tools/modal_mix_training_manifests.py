@@ -39,6 +39,16 @@ class MixConfig:
     seed: int = 42
     dedupe_text: bool = True
     max_samples_per_speaker: int = 0
+    selection_strategy: str = "random"
+    min_duration_seconds: float | None = None
+    max_duration_seconds: float | None = None
+    min_word_count: int | None = None
+    max_word_count: int | None = None
+    reject_format_sensitive: bool = False
+    min_selection_score: float | None = None
+    min_base_cer: float | None = None
+    max_base_cer: float | None = None
+    max_teacher_cer: float | None = None
 
 
 def _now_utc() -> str:
@@ -92,6 +102,129 @@ def _text_key(row: dict[str, Any]) -> str:
     return text
 
 
+def _as_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_text(row: dict[str, Any]) -> str:
+    return str(row.get("text") or row.get("normalized_transcript") or row.get("transcript") or "")
+
+
+def _word_count(row: dict[str, Any]) -> int:
+    return len(_as_text(row).split())
+
+
+def _duration_seconds(row: dict[str, Any]) -> float | None:
+    for key in ("duration_seconds", "audio_seconds", "duration", "duration_sec"):
+        value = _as_float(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _metric_value(row: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = _as_float(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _row_selection_score(row: dict[str, Any]) -> float:
+    explicit = _metric_value(row, ("selection_score", "score", "hard_score"))
+    if explicit is not None:
+        return explicit
+    base_cer = _metric_value(row, ("base_cer", "turbo_cer", "whisper_turbo_cer"))
+    teacher_cer = _metric_value(row, ("teacher_cer", "large_v3_cer", "whisper_large_v3_cer"))
+    if base_cer is not None and teacher_cer is not None:
+        return base_cer - teacher_cer
+    if base_cer is not None:
+        return base_cer
+    return 0.0
+
+
+def _is_format_sensitive(row: dict[str, Any]) -> bool:
+    text = _as_text(row)
+    lowered = text.lower()
+    if re.search(r"\d", text):
+        return True
+    if re.search(r"[$₹€£]|\b(?:rs|inr|usd|dollars?|rupees?)\b", lowered):
+        return True
+    if re.search(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", lowered):
+        return True
+    if re.search(r"<[^>]+>|&[a-z]+;", lowered):
+        return True
+    return False
+
+
+def _passes_quality_filters(row: dict[str, Any], config: MixConfig) -> tuple[bool, str | None]:
+    duration = _duration_seconds(row)
+    if config.min_duration_seconds is not None and (
+        duration is None or duration < config.min_duration_seconds
+    ):
+        return False, "min_duration_seconds"
+    if config.max_duration_seconds is not None and (
+        duration is None or duration > config.max_duration_seconds
+    ):
+        return False, "max_duration_seconds"
+
+    words = _word_count(row)
+    if config.min_word_count is not None and words < config.min_word_count:
+        return False, "min_word_count"
+    if config.max_word_count is not None and words > config.max_word_count:
+        return False, "max_word_count"
+
+    if config.reject_format_sensitive and _is_format_sensitive(row):
+        return False, "format_sensitive"
+
+    score = _row_selection_score(row)
+    if config.min_selection_score is not None and score < config.min_selection_score:
+        return False, "min_selection_score"
+
+    base_cer = _metric_value(row, ("base_cer", "turbo_cer", "whisper_turbo_cer"))
+    if config.min_base_cer is not None and (base_cer is None or base_cer < config.min_base_cer):
+        return False, "min_base_cer"
+    if config.max_base_cer is not None and (base_cer is None or base_cer > config.max_base_cer):
+        return False, "max_base_cer"
+
+    teacher_cer = _metric_value(row, ("teacher_cer", "large_v3_cer", "whisper_large_v3_cer"))
+    if config.max_teacher_cer is not None and (
+        teacher_cer is None or teacher_cer > config.max_teacher_cer
+    ):
+        return False, "max_teacher_cer"
+
+    return True, None
+
+
+def _select_source_rows(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int,
+    rng: random.Random,
+    selection_strategy: str,
+) -> list[dict[str, Any]]:
+    if limit <= 0 or len(rows) <= limit:
+        return list(rows)
+    if selection_strategy == "random":
+        return rng.sample(rows, limit)
+    if selection_strategy == "score":
+        return sorted(
+            rows,
+            key=lambda row: (
+                _row_selection_score(row),
+                _duration_seconds(row) or 0.0,
+                _word_count(row),
+            ),
+            reverse=True,
+        )[:limit]
+    raise ValueError("selection_strategy must be one of: random, score")
+
+
 def _speaker_key(row: dict[str, Any]) -> str:
     for key in (
         "speaker_key",
@@ -112,9 +245,11 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     durations = []
     word_counts = []
     labels: dict[str, int] = {}
+    scores = []
     for row in rows:
         label = str(row.get("mix_source") or "")
         labels[label] = labels.get(label, 0) + 1
+        scores.append(_row_selection_score(row))
         try:
             durations.append(float(row["duration_seconds"]))
         except (KeyError, TypeError, ValueError):
@@ -140,6 +275,7 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "rows_by_source": dict(sorted(labels.items())),
         "duration_seconds": numeric(durations),
         "word_count": numeric([float(value) for value in word_counts]),
+        "selection_score": numeric(scores),
     }
 
 
@@ -155,6 +291,24 @@ def mix_manifests_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
         seed=int(config_payload.get("seed", 42)),
         dedupe_text=bool(config_payload.get("dedupe_text", True)),
         max_samples_per_speaker=int(config_payload.get("max_samples_per_speaker", 0)),
+        selection_strategy=str(config_payload.get("selection_strategy") or "random"),
+        min_duration_seconds=_as_float(config_payload.get("min_duration_seconds")),
+        max_duration_seconds=_as_float(config_payload.get("max_duration_seconds")),
+        min_word_count=(
+            int(config_payload["min_word_count"])
+            if config_payload.get("min_word_count") is not None
+            else None
+        ),
+        max_word_count=(
+            int(config_payload["max_word_count"])
+            if config_payload.get("max_word_count") is not None
+            else None
+        ),
+        reject_format_sensitive=bool(config_payload.get("reject_format_sensitive", False)),
+        min_selection_score=_as_float(config_payload.get("min_selection_score")),
+        min_base_cer=_as_float(config_payload.get("min_base_cer")),
+        max_base_cer=_as_float(config_payload.get("max_base_cer")),
+        max_teacher_cer=_as_float(config_payload.get("max_teacher_cer")),
     )
     rng = random.Random(config.seed)
     run_id = f"{config.mix_name}-{_now_utc()}"
@@ -167,27 +321,38 @@ def mix_manifests_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
         source_path = Path(source.path)
         if not source_path.is_absolute():
             source_path = ARTIFACTS_DIR / source.path.lstrip("/")
-        rows = _load_jsonl(source_path)
-        if source.limit <= 0:
-            selected = rows
-        elif len(rows) <= source.limit:
-            selected = rows
-        else:
-            selected = rng.sample(rows, source.limit)
+        rows = [_canonicalize_training_row(row) for row in _load_jsonl(source_path)]
+        filter_counts: dict[str, int] = {}
+        filtered_rows = []
+        for row in rows:
+            passes, reason = _passes_quality_filters(row, config)
+            if not passes:
+                filter_counts[str(reason)] = filter_counts.get(str(reason), 0) + 1
+                continue
+            filtered_rows.append(row)
+        selected = _select_source_rows(
+            filtered_rows,
+            limit=source.limit,
+            rng=rng,
+            selection_strategy=config.selection_strategy,
+        )
         for row_index, row in enumerate(selected):
-            mixed_row = _canonicalize_training_row(row)
+            mixed_row = dict(row)
             mixed_row["mix_source"] = source.label
             mixed_row["mix_source_manifest"] = str(source_path)
             mixed_row["mix_source_index"] = source_index
             mixed_row["mix_source_row_index"] = row_index
+            mixed_row["mix_selection_score"] = _row_selection_score(row)
             selected_rows.append(mixed_row)
         source_reports.append(
             {
                 "label": source.label,
                 "path": str(source_path),
                 "available_rows": len(rows),
+                "rows_after_quality_filters": len(filtered_rows),
                 "selected_rows": len(selected),
                 "limit": source.limit,
+                "filter_counts": filter_counts,
             }
         )
 
@@ -234,6 +399,16 @@ def mix_manifests_remote(config_payload: dict[str, Any]) -> dict[str, Any]:
         "filters": {
             "dedupe_text": config.dedupe_text,
             "max_samples_per_speaker": config.max_samples_per_speaker,
+            "selection_strategy": config.selection_strategy,
+            "min_duration_seconds": config.min_duration_seconds,
+            "max_duration_seconds": config.max_duration_seconds,
+            "min_word_count": config.min_word_count,
+            "max_word_count": config.max_word_count,
+            "reject_format_sensitive": config.reject_format_sensitive,
+            "min_selection_score": config.min_selection_score,
+            "min_base_cer": config.min_base_cer,
+            "max_base_cer": config.max_base_cer,
+            "max_teacher_cer": config.max_teacher_cer,
             "filter_counts": filter_counts,
         },
         "summary": _summarize(selected_rows),
@@ -271,6 +446,16 @@ def main(
     seed: int = 42,
     dedupe_text: bool = True,
     max_samples_per_speaker: int = 0,
+    selection_strategy: str = "random",
+    min_duration_seconds: float | None = None,
+    max_duration_seconds: float | None = None,
+    min_word_count: int | None = None,
+    max_word_count: int | None = None,
+    reject_format_sensitive: bool = False,
+    min_selection_score: float | None = None,
+    min_base_cer: float | None = None,
+    max_base_cer: float | None = None,
+    max_teacher_cer: float | None = None,
 ) -> None:
     report = mix_manifests_remote.remote(
         {
@@ -279,6 +464,16 @@ def main(
             "seed": seed,
             "dedupe_text": dedupe_text,
             "max_samples_per_speaker": max_samples_per_speaker,
+            "selection_strategy": selection_strategy,
+            "min_duration_seconds": min_duration_seconds,
+            "max_duration_seconds": max_duration_seconds,
+            "min_word_count": min_word_count,
+            "max_word_count": max_word_count,
+            "reject_format_sensitive": reject_format_sensitive,
+            "min_selection_score": min_selection_score,
+            "min_base_cer": min_base_cer,
+            "max_base_cer": max_base_cer,
+            "max_teacher_cer": max_teacher_cer,
         }
     )
     print(json.dumps(report, indent=2, sort_keys=True))

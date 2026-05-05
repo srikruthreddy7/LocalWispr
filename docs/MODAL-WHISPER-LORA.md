@@ -15,7 +15,7 @@ The training script also supports local JSONL manifests mounted from the artifac
 
 The training script now supports comma-separated config lists for dataset-backed supplements such as the confirmed Vaani district pool. This is the intended way to attach `Vaani supplement v1` as a second training source without pre-merging it offline.
 
-Current status as of May 1, 2026:
+Current status as of May 5, 2026:
 
 - the current full-Svarah inference sweep supersedes the earlier tiny-adapter read
 - no existing LoRA adapter or adapter scale beats `openai/whisper-large-v3-turbo` under the current eval path
@@ -24,6 +24,10 @@ Current status as of May 1, 2026:
 - NVIDIA `parakeet-tdt-0.6b-v2` is much faster than Whisper but loses badly on Svarah WER/CER
 - Cohere Transcribe served through vLLM is faster than Whisper turbo on one GPU, but less accurate on Svarah
 - Cohere dynamic LoRA adapters are not supported by vLLM today; the practical Cohere fine-tuning path is LoRA training, adapter merge, then vLLM serving of the merged checkpoint
+- the May 4 Cohere encoder-LoRA smoke improved the first 64 Svarah rows, but the full Svarah run regressed slightly against base Cohere, so it should not be promoted
+- the merged Cohere checkpoint can be made vLLM-loadable, but the current merged-checkpoint validation path is blocked by a vLLM `0.20.x` Cohere ASR audio-placeholder failure
+- Qwen3-ASR-1.7B served through vLLM is fast but not accurate enough on full Svarah: WER/CER `0.1795` / `0.1054`
+- Canary-Qwen-2.5B now runs through the NeMo SALM path, but full Svarah WER/CER `0.1054` / `0.0564` is still worse than Cohere, Whisper turbo, and Whisper large-v3
 - Voxtral Mini 4B Realtime fits on one L40S, but the measured Svarah smoke run is not usable because it often emits phonetic English in non-Latin script
 - do not spend more training on the current curated or bucketed recipes
 
@@ -32,10 +36,10 @@ Next research direction:
 - build hard-example manifests where turbo is wrong, `large-v3` agrees with the transcript, and labels are clean
 - train only a small mined-data adapter first
 - separately evaluate a confidence/router path, because the oracle gap is large
-- test a merged Cohere LoRA checkpoint in vLLM only if we have a Cohere LoRA worth merging
+- retest merged Cohere in vLLM only after the Cohere ASR placeholder path is fixed or a known-good invocation is found
 - if training continues, prefer encoder-only LoRA with base-KL preservation, mild SpecAugment, and possibly LoRA+
 
-The detailed May 1 backend bakeoff and Cohere/vLLM adapter decision live in [`docs/ACCENT-DATA-PIPELINE.md`](./ACCENT-DATA-PIPELINE.md#may-1-vllm-asr-backend-and-adapter-investigation).
+The detailed May 1 backend bakeoff, May 4 Cohere LoRA proof, and May 5 Qwen/Canary bakeoff live in [`docs/ACCENT-DATA-PIPELINE.md`](./ACCENT-DATA-PIPELINE.md#may-1-vllm-asr-backend-and-adapter-investigation), [`docs/ACCENT-DATA-PIPELINE.md`](./ACCENT-DATA-PIPELINE.md#may-4-cohere-lora-proof), and [`docs/ACCENT-DATA-PIPELINE.md`](./ACCENT-DATA-PIPELINE.md#may-5-qwen-and-canary-asr-bakeoff).
 
 ## Why this setup
 

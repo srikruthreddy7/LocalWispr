@@ -60,6 +60,7 @@ transformers_image = (
         "librosa",
         "numpy",
         "protobuf",
+        "peft",
         "sentencepiece",
         "soundfile",
         "torch",
@@ -83,6 +84,26 @@ nemo_image = (
         "transformers",
     )
     .pip_install("nemo_toolkit[asr]")
+    .env(COMMON_ENV)
+)
+
+nemo_salm_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg", "git", "libsndfile1", "wget")
+    .pip_install("uv")
+    .run_commands(
+        'uv pip install --system "datasets[audio]" "jiwer" "librosa" "numpy" '
+        '"soundfile" "transformers"'
+    )
+    .run_commands(
+        'uv pip install --system "nemo_toolkit[asr,tts] @ git+https://github.com/NVIDIA/NeMo.git"'
+    )
+    .run_commands(
+        "uv pip install --system --force-reinstall "
+        "--index-url https://download.pytorch.org/whl/cu129 "
+        '"torch==2.9.1" "torchaudio==2.9.1"'
+    )
+    .run_commands('uv pip install --system --force-reinstall "torchcodec==0.9.0"')
     .env(COMMON_ENV)
 )
 
@@ -112,6 +133,7 @@ class AsrModelSpec:
     label: str
     backend: str
     model_name: str
+    adapter_scale: float | None = None
 
 
 @dataclass
@@ -155,6 +177,8 @@ DEFAULT_MODEL_SPECS = [
         model_name="nvidia/parakeet-unified-en-0.6b",
     ),
 ]
+
+COHERE_BASE_MODEL = "CohereLabs/cohere-transcribe-03-2026"
 
 
 def _now_iso() -> str:
@@ -275,18 +299,77 @@ def _text_normalizer():
         return normalize
 
 
+def _resolve_local_manifest_path(name: str) -> Path:
+    path = Path(name)
+    if path.is_absolute():
+        return path
+    return ARTIFACTS_DIR / name.lstrip("/")
+
+
+def _looks_like_local_manifest(name: str) -> bool:
+    path = Path(name)
+    if path.is_absolute():
+        return True
+    return name.startswith("/artifacts/") or path.suffix.lower() in {".jsonl", ".json", ".csv"}
+
+
+def _canonicalize_manifest_row(row: dict[str, Any], *, audio_column: str | None) -> dict[str, Any]:
+    canonical = dict(row)
+    candidate_audio_columns = [audio_column] if audio_column else []
+    candidate_audio_columns.extend(["audio", "audio_path", "audio_filepath", "path", "file", "wav"])
+    for column in candidate_audio_columns:
+        if not column or column not in canonical or not isinstance(canonical[column], str):
+            continue
+        audio_path = canonical[column].strip()
+        if not audio_path:
+            continue
+        if not Path(audio_path).is_absolute():
+            audio_path = str(ARTIFACTS_DIR / audio_path.lstrip("/"))
+        canonical[column] = audio_path
+        canonical["local_audio_path"] = audio_path
+        break
+    return canonical
+
+
+def _load_local_manifest(config: DatasetConfig):
+    from datasets import Dataset, load_dataset
+
+    path = _resolve_local_manifest_path(config.name)
+    suffix = path.suffix.lower()
+    if suffix == ".jsonl":
+        rows: list[dict[str, Any]] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    rows.append(
+                        _canonicalize_manifest_row(json.loads(line), audio_column=config.audio_column)
+                    )
+        return Dataset.from_list(rows)
+
+    builder_name = "json" if suffix == ".json" else "csv"
+    split_name = config.split or "train"
+    dataset = load_dataset(builder_name, data_files={split_name: str(path)}, split=split_name)
+    return dataset.map(
+        lambda row: _canonicalize_manifest_row(row, audio_column=config.audio_column),
+        desc="canonicalize local manifest",
+    )
+
+
 def _load_dataset_split(config: DatasetConfig, *, token: str | None):
     from datasets import Audio, load_dataset
 
-    kwargs: dict[str, Any] = {
-        "path": config.name,
-        "split": config.split or "test",
-        "token": token,
-        "trust_remote_code": config.trust_remote_code,
-    }
-    if config.config:
-        kwargs["name"] = config.config
-    dataset = load_dataset(**kwargs)
+    if _looks_like_local_manifest(config.name):
+        dataset = _load_local_manifest(config)
+    else:
+        kwargs: dict[str, Any] = {
+            "path": config.name,
+            "split": config.split or "test",
+            "token": token,
+            "trust_remote_code": config.trust_remote_code,
+        }
+        if config.config:
+            kwargs["name"] = config.config
+        dataset = load_dataset(**kwargs)
     if config.max_samples and len(dataset) > config.max_samples:
         dataset = dataset.select(range(config.max_samples))
 
@@ -439,16 +522,36 @@ def _progress_payload(
 def _load_transformers_model(spec: AsrModelSpec, config: AsrBakeoffConfig, *, token: str | None):
     import torch
 
-    if spec.backend == "cohere_transformers":
+    if spec.backend in {"cohere_transformers", "cohere_transformers_peft"}:
         from transformers import AutoProcessor, CohereAsrForConditionalGeneration
 
-        processor = AutoProcessor.from_pretrained(spec.model_name, token=token)
+        model_name = spec.model_name
+        adapter_path: Path | None = None
+        if spec.backend == "cohere_transformers_peft":
+            candidate = Path(spec.model_name)
+            adapter_path = candidate if candidate.is_absolute() else ARTIFACTS_DIR / spec.model_name / "adapter"
+            if not adapter_path.exists():
+                raise FileNotFoundError(f"Cohere PEFT adapter not found: {adapter_path}")
+            adapter_config_path = adapter_path / "adapter_config.json"
+            if adapter_config_path.exists():
+                adapter_config = json.loads(adapter_config_path.read_text(encoding="utf-8"))
+                model_name = str(adapter_config.get("base_model_name_or_path") or COHERE_BASE_MODEL)
+            else:
+                model_name = COHERE_BASE_MODEL
+
+        processor = AutoProcessor.from_pretrained(model_name, token=token)
         model = CohereAsrForConditionalGeneration.from_pretrained(
-            spec.model_name,
+            model_name,
             device_map="auto",
             torch_dtype=torch.bfloat16,
             token=token,
         )
+        if adapter_path is not None:
+            from peft import PeftModel
+
+            model = PeftModel.from_pretrained(model, str(adapter_path))
+            if spec.adapter_scale is not None:
+                _apply_peft_adapter_scale(model, spec.adapter_scale)
         model.eval()
         return model, processor
 
@@ -467,6 +570,21 @@ def _load_transformers_model(spec: AsrModelSpec, config: AsrBakeoffConfig, *, to
     model.to("cuda")
     model.eval()
     return model, processor
+
+
+def _apply_peft_adapter_scale(model: Any, adapter_scale: float) -> None:
+    for module in model.modules():
+        scaling = getattr(module, "scaling", None)
+        if not isinstance(scaling, dict):
+            continue
+        for adapter_name, current_scale in list(scaling.items()):
+            base_scales = getattr(module, "_localwispr_base_scaling", None)
+            if base_scales is None:
+                base_scales = {}
+                setattr(module, "_localwispr_base_scaling", base_scales)
+            if adapter_name not in base_scales:
+                base_scales[adapter_name] = float(current_scale)
+            scaling[adapter_name] = base_scales[adapter_name] * adapter_scale
 
 
 def _predict_transformers(
@@ -510,7 +628,9 @@ def _predict_transformers(
         batch_audio_seconds = sum(audio_seconds_batch)
 
         batch_started = time.monotonic()
-        if spec.backend == "cohere_transformers":
+        if spec.backend in {"cohere_transformers", "cohere_transformers_peft"}:
+            model_device = getattr(model, "device", None) or next(model.parameters()).device
+            model_dtype = getattr(model, "dtype", None) or next(model.parameters()).dtype
             inputs = processor(
                 arrays,
                 sampling_rate=16_000,
@@ -519,7 +639,7 @@ def _predict_transformers(
                 punctuation=config.punctuation,
             )
             audio_chunk_index = inputs.get("audio_chunk_index")
-            inputs.to(model.device, dtype=model.dtype)
+            inputs.to(model_device, dtype=model_dtype)
             with torch.no_grad():
                 try:
                     generated_ids = model.generate(**inputs, max_new_tokens=config.max_new_tokens)
@@ -620,12 +740,210 @@ def _load_nemo_model(spec: AsrModelSpec):
     return model
 
 
+def _load_nemo_salm_model(spec: AsrModelSpec):
+    from nemo.collections.speechlm2.models import SALM
+
+    model = SALM.from_pretrained(spec.model_name)
+    model.to("cuda")
+    model.eval()
+    return model
+
+
+def _prefetch_nemo_models(model_specs: list[AsrModelSpec]) -> None:
+    """Download and restore NeMo checkpoints once before parallel workers start."""
+    import gc
+
+    import nemo.collections.asr as nemo_asr
+    import torch
+
+    seen: set[str] = set()
+    for spec in model_specs:
+        if spec.backend != "nemo" or spec.model_name in seen:
+            continue
+        seen.add(spec.model_name)
+        started = time.monotonic()
+        print(f"[asr:nemo-prefetch] loading {spec.model_name}", flush=True)
+        model = nemo_asr.models.ASRModel.from_pretrained(model_name=spec.model_name)
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(
+            f"[asr:nemo-prefetch] ready {spec.model_name} in {time.monotonic() - started:.2f}s",
+            flush=True,
+        )
+
+
+def _prefetch_nemo_salm_models(model_specs: list[AsrModelSpec]) -> None:
+    """Download and restore NeMo SALM checkpoints once before parallel workers start."""
+    import gc
+
+    import torch
+    from nemo.collections.speechlm2.models import SALM
+
+    seen: set[str] = set()
+    for spec in model_specs:
+        if spec.backend != "nemo_salm" or spec.model_name in seen:
+            continue
+        seen.add(spec.model_name)
+        started = time.monotonic()
+        print(f"[asr:nemo-salm-prefetch] loading {spec.model_name}", flush=True)
+        model = SALM.from_pretrained(spec.model_name)
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(
+            f"[asr:nemo-salm-prefetch] ready {spec.model_name} in {time.monotonic() - started:.2f}s",
+            flush=True,
+        )
+
+
 def _nemo_prediction_text(item: Any) -> str:
     if hasattr(item, "text"):
         return str(item.text)
     if isinstance(item, dict) and "text" in item:
         return str(item["text"])
     return str(item)
+
+
+def _decode_salm_outputs(model: Any, answer_ids: Any) -> list[str]:
+    if hasattr(answer_ids, "detach"):
+        answer_items = list(answer_ids)
+    else:
+        answer_items = list(answer_ids or [])
+    predictions: list[str] = []
+    for item in answer_items:
+        if hasattr(item, "cpu"):
+            item = item.cpu()
+        predictions.append(str(model.tokenizer.ids_to_text(item)))
+    return predictions
+
+
+def _predict_nemo_salm(
+    *,
+    spec: AsrModelSpec,
+    model: Any,
+    dataset,
+    audio_column: str,
+    text_column: str,
+    config: AsrBakeoffConfig,
+    phase_name: str,
+    phase_key: str,
+    progress_path: Path,
+) -> dict[str, Any]:
+    import soundfile as sf
+
+    normalizer = _text_normalizer()
+    total_samples = len(dataset)
+    batch_size = max(1, config.per_device_eval_batch_size)
+    total_batches = int(math.ceil(total_samples / batch_size)) if total_samples else 0
+    temp_dir = Path("/tmp/localwispr-asr-bakeoff") / phase_key
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    started_at = time.monotonic()
+    inference_seconds_done = 0.0
+    audio_seconds_done = 0.0
+    predictions: list[str] = []
+    references: list[str] = []
+    audio_second_values: list[float] = []
+    batch_latency_values: list[float] = []
+    amortized_latency_values: list[float] = []
+
+    try:
+        for batch_index, start in enumerate(range(0, total_samples, batch_size), start=1):
+            stop = min(start + batch_size, total_samples)
+            batch = dataset.select(range(start, stop))
+            paths: list[str] = []
+            refs: list[str] = []
+            batch_audio_seconds = 0.0
+            for offset, row in enumerate(batch):
+                audio = row[audio_column]
+                array, sample_rate = _audio_to_array_and_rate(audio)
+                audio_seconds = (float(len(array)) / float(sample_rate)) if sample_rate else 0.0
+                wav_path = temp_dir / f"{start + offset:08d}.wav"
+                sf.write(str(wav_path), array, sample_rate)
+                paths.append(str(wav_path))
+                refs.append(str(row[text_column]))
+                batch_audio_seconds += audio_seconds
+                audio_second_values.append(audio_seconds)
+
+            prompts = [
+                [
+                    {
+                        "role": "user",
+                        "content": f"Transcribe the following: {model.audio_locator_tag}",
+                        "audio": [path],
+                    }
+                ]
+                for path in paths
+            ]
+            batch_started = time.monotonic()
+            answer_ids = model.generate(prompts=prompts, max_new_tokens=config.max_new_tokens)
+            preds = _decode_salm_outputs(model, answer_ids)
+            batch_elapsed = time.monotonic() - batch_started
+
+            inference_seconds_done += batch_elapsed
+            audio_seconds_done += batch_audio_seconds
+            predictions.extend(preds)
+            references.extend(refs)
+            batch_latency_values.append(batch_elapsed)
+            amortized_latency_values.extend([batch_elapsed / max(1, len(paths))] * len(paths))
+
+            for path in paths:
+                try:
+                    Path(path).unlink()
+                except FileNotFoundError:
+                    pass
+
+            if (
+                batch_index == 1
+                or batch_index % max(1, config.progress_log_interval_batches) == 0
+                or stop >= total_samples
+            ):
+                payload = _progress_payload(
+                    phase_name=phase_name,
+                    status="predicting",
+                    samples_done=stop,
+                    samples_total=total_samples,
+                    batches_done=batch_index,
+                    batches_total=total_batches,
+                    audio_seconds_done=audio_seconds_done,
+                    started_at=started_at,
+                    inference_seconds_done=inference_seconds_done,
+                )
+                _write_json(progress_path, payload)
+                artifacts_volume.commit()
+                print(
+                    f"[asr:{phase_name}] batches {batch_index}/{total_batches} "
+                    f"samples {stop}/{total_samples} rtfx={payload['current_rtfx']}"
+                )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    normalized_predictions = [normalizer(text).strip() for text in predictions]
+    normalized_references = [normalizer(text).strip() for text in references]
+    return {
+        "predictions": predictions,
+        "references": references,
+        "normalized_predictions": normalized_predictions,
+        "normalized_references": normalized_references,
+        "timing": {
+            "inference_seconds": inference_seconds_done,
+            "audio_seconds_total": audio_seconds_done,
+            "rtfx": (audio_seconds_done / inference_seconds_done)
+            if inference_seconds_done > 0
+            else None,
+            "audio_seconds_values": audio_second_values,
+            "batch_latency_seconds_values": batch_latency_values,
+            "amortized_sample_latency_seconds_values": amortized_latency_values,
+            "audio_seconds": _summarize_numeric(audio_second_values),
+            "batch_latency_seconds": _summarize_numeric(batch_latency_values),
+            "amortized_sample_latency_seconds": _summarize_numeric(amortized_latency_values),
+        },
+    }
 
 
 def _predict_nemo(
@@ -799,12 +1117,26 @@ def _asr_worker_main_impl(config_path: str) -> None:
     model_load_started = time.monotonic()
     if spec.backend == "nemo":
         model = _load_nemo_model(spec)
+    elif spec.backend == "nemo_salm":
+        model = _load_nemo_salm_model(spec)
     else:
         model, processor = _load_transformers_model(spec, config, token=hf_token)
     model_load_seconds = time.monotonic() - model_load_started
 
     if spec.backend == "nemo":
         prediction_payload = _predict_nemo(
+            spec=spec,
+            model=model,
+            dataset=shard_dataset,
+            audio_column=audio_column,
+            text_column=text_column,
+            config=config,
+            phase_name=phase_name,
+            phase_key=phase_key,
+            progress_path=progress_path,
+        )
+    elif spec.backend == "nemo_salm":
+        prediction_payload = _predict_nemo_salm(
             spec=spec,
             model=model,
             dataset=shard_dataset,
@@ -1147,6 +1479,23 @@ def _run_backend_group(
         backend_group=backend_group,
         model_specs=model_specs,
     )
+    if backend_group in {"nemo", "nemo_salm"}:
+        _write_json(
+            _backend_progress_path(run_id, backend_group),
+            {
+                "stage": "asr_bakeoff",
+                "backend_group": backend_group,
+                "status": "prefetching_models",
+                "updated_at_utc": _now_iso(),
+                "run_id": run_id,
+                "models": [asdict(spec) for spec in model_specs],
+            },
+        )
+        artifacts_volume.commit()
+        if backend_group == "nemo":
+            _prefetch_nemo_models(model_specs)
+        else:
+            _prefetch_nemo_salm_models(model_specs)
     _run_worker_processes(
         run_id=run_id,
         backend_group=backend_group,
@@ -1180,6 +1529,9 @@ def _normalize_model_spec(payload: dict[str, Any] | AsrModelSpec) -> AsrModelSpe
         label=str(payload["label"]),
         backend=str(payload["backend"]),
         model_name=str(payload["model_name"]),
+        adapter_scale=float(payload["adapter_scale"])
+        if payload.get("adapter_scale") is not None
+        else None,
     )
 
 
@@ -1523,6 +1875,62 @@ def asr_bakeoff_nemo_5gpu_remote(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.function(
+    image=nemo_salm_image,
+    gpu=FIVE_GPU,
+    timeout=60 * 60 * 4,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={
+        str(ARTIFACTS_DIR): artifacts_volume,
+        str(HF_CACHE_DIR): hf_cache_volume,
+    },
+)
+def asr_bakeoff_nemo_salm_5gpu_remote(payload: dict[str, Any]) -> dict[str, Any]:
+    os.environ["MODAL_GPU_LABEL"] = FIVE_GPU
+    config = _normalize_config(payload["config"])
+    run_id = str(payload["run_id"])
+    model_specs = [_normalize_model_spec(item) for item in payload["model_specs"]]
+    return _run_backend_group(
+        run_id=run_id,
+        config=config,
+        backend_group="nemo_salm",
+        model_specs=model_specs,
+    )
+
+
+@app.function(
+    image=transformers_image,
+    gpu=FIVE_GPU,
+    timeout=60 * 60 * 4,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={
+        str(ARTIFACTS_DIR): artifacts_volume,
+        str(HF_CACHE_DIR): hf_cache_volume,
+    },
+)
+def asr_bakeoff_transformers_full_remote(payload: dict[str, Any]) -> dict[str, Any]:
+    os.environ["MODAL_GPU_LABEL"] = FIVE_GPU
+    config = _normalize_config(payload["config"])
+    run_id = str(payload["run_id"])
+    model_specs = [_normalize_model_spec(item) for item in payload["model_specs"]]
+    unsupported = [
+        spec.backend
+        for spec in model_specs
+        if spec.backend not in {"whisper_transformers", "cohere_transformers", "cohere_transformers_peft"}
+    ]
+    if unsupported:
+        raise ValueError(f"full_remote only supports Transformers backends, got {sorted(set(unsupported))}")
+    _run_backend_group(
+        run_id=run_id,
+        config=config,
+        backend_group="transformers",
+        model_specs=model_specs,
+    )
+    report = _combine_impl(config, run_id=run_id)
+    hf_cache_volume.commit()
+    return report
+
+
+@app.function(
     image=combine_image,
     timeout=60 * 30,
     secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
@@ -1543,19 +1951,29 @@ def _parse_models(value: str) -> list[AsrModelSpec]:
             specs.append(aliases[item])
             continue
         pieces = [piece.strip() for piece in item.split("|")]
-        if len(pieces) != 3:
+        if len(pieces) not in {3, 4}:
             raise ValueError(
-                "bakeoff_models entries must be aliases or label|backend|model_name"
+                "bakeoff_models entries must be aliases or label|backend|model_name[|adapter_scale]"
             )
-        specs.append(AsrModelSpec(label=pieces[0], backend=pieces[1], model_name=pieces[2]))
+        specs.append(
+            AsrModelSpec(
+                label=pieces[0],
+                backend=pieces[1],
+                model_name=pieces[2],
+                adapter_scale=float(pieces[3]) if len(pieces) == 4 else None,
+            )
+        )
     return specs
 
 
 def _run_bakeoff(config: AsrBakeoffConfig, *, run_id: str, parallel_backend_jobs: bool) -> dict[str, Any]:
     transformers_specs = [
-        spec for spec in config.model_specs if spec.backend in {"whisper_transformers", "cohere_transformers"}
+        spec
+        for spec in config.model_specs
+        if spec.backend in {"whisper_transformers", "cohere_transformers", "cohere_transformers_peft"}
     ]
     nemo_specs = [spec for spec in config.model_specs if spec.backend == "nemo"]
+    nemo_salm_specs = [spec for spec in config.model_specs if spec.backend == "nemo_salm"]
     remote_payloads = []
     if transformers_specs:
         remote_payloads.append(
@@ -1576,6 +1994,17 @@ def _run_bakeoff(config: AsrBakeoffConfig, *, run_id: str, parallel_backend_jobs
                     "run_id": run_id,
                     "config": asdict(config),
                     "model_specs": [asdict(spec) for spec in nemo_specs],
+                },
+            )
+        )
+    if nemo_salm_specs:
+        remote_payloads.append(
+            (
+                asr_bakeoff_nemo_salm_5gpu_remote,
+                {
+                    "run_id": run_id,
+                    "config": asdict(config),
+                    "model_specs": [asdict(spec) for spec in nemo_salm_specs],
                 },
             )
         )
@@ -1609,9 +2038,10 @@ def main(
     max_new_tokens: int = 256,
     progress_log_interval_batches: int = 10,
     parallel_backend_jobs: bool = False,
+    existing_run_id: str = "",
 ) -> None:
-    if mode not in {"smoke", "full", "asr_bakeoff"}:
-        raise ValueError("mode must be one of: smoke, full, asr_bakeoff")
+    if mode not in {"smoke", "full", "asr_bakeoff", "combine", "full_remote", "remote_full"}:
+        raise ValueError("mode must be one of: smoke, full, asr_bakeoff, combine, full_remote")
 
     max_samples = svarah_max_samples or None
     if mode == "smoke":
@@ -1634,7 +2064,27 @@ def main(
         max_new_tokens=max_new_tokens,
         progress_log_interval_batches=progress_log_interval_batches,
     )
+
+    if mode == "combine":
+        run_id = existing_run_id.strip()
+        if not run_id:
+            raise ValueError("--existing-run-id is required for --mode combine")
+        report = asr_bakeoff_combine_remote.remote({"run_id": run_id, "config": asdict(config)})
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+
     run_id = f"{bakeoff_name}-{_now_utc()}"
+    if mode in {"full_remote", "remote_full"}:
+        report = asr_bakeoff_transformers_full_remote.remote(
+            {
+                "run_id": run_id,
+                "config": asdict(config),
+                "model_specs": [asdict(spec) for spec in config.model_specs],
+            }
+        )
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+
     report = _run_bakeoff(config, run_id=run_id, parallel_backend_jobs=parallel_backend_jobs)
     print(json.dumps(report, indent=2, sort_keys=True))
 

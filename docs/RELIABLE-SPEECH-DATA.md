@@ -8,7 +8,7 @@ The short version is simple:
 - the blocker is training data that does not match the target
 - the next full run should wait until the data passes a manual audit
 
-May 1 update:
+May 5 update:
 
 - the curated Common Voice 1k run did not beat base Whisper on full Svarah
 - the bucketed transfer 1k run also did not beat base Whisper on full Svarah
@@ -18,8 +18,13 @@ May 1 update:
 - the May 1 routing probes did not beat the best fixed adapter; text-only routing collapsed to fixed adapter choices
 - Cohere Transcribe through vLLM is much faster than Whisper turbo on a single GPU, but less accurate on Svarah
 - Cohere dynamic LoRA adapters are not supported by vLLM today; preserving vLLM speed requires a merged checkpoint path
+- the May 4 Cohere encoder-LoRA probe improved a 64-row smoke set but lost slightly on full Svarah, so the current Cohere adapter is not a usable accent win
+- the merged Cohere checkpoint can be made vLLM-loadable, but the current merged-checkpoint validation path fails before generation on a vLLM `0.20.x` audio-placeholder path
+- Qwen3-ASR-1.7B through vLLM is fast, but full Svarah WER/CER `0.1795` / `0.1054` is not viable for the accent objective
+- Canary-Qwen-2.5B now runs through NeMo SALM with 5-GPU sharding, but full Svarah WER/CER `0.1054` / `0.0564` still loses to Cohere and Whisper
 - Voxtral Mini 4B Realtime is cheap enough for one L40S, but failed this English benchmark because of non-Latin phonetic outputs
-- the next step is no longer another broad Whisper LoRA run; it needs either better non-Svarah data, confidence/logprob routing, or a merged-Cohere proof
+- the repo now has a fail-closed non-Svarah promotion gate in `tools/modal_accent_validation_gate.py`
+- the next step is no longer another broad LoRA run; it needs stronger non-Svarah gates, base-preservation/distillation, confidence routing, or a vLLM Cohere ASR fix before another full Svarah check
 
 ## Current conclusion
 
@@ -61,6 +66,8 @@ Initial hard-example filters:
 - duration `1.5-8s`, with most quota in `3-6s`
 - word count `4-16`
 - speaker cap `4-8`
+- use `reliable_accent` for clean anchor/audit manifests
+- run `tools/modal_accent_validation_gate.py` on non-Svarah pairwise artifacts before any final Svarah check
 
 The inference sweep also showed a large routing/teacher signal:
 
