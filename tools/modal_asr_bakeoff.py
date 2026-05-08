@@ -733,8 +733,11 @@ def _predict_transformers(
 
 def _load_nemo_model(spec: AsrModelSpec):
     import nemo.collections.asr as nemo_asr
+    from omegaconf import OmegaConf
 
     model = nemo_asr.models.ASRModel.from_pretrained(model_name=spec.model_name)
+    if getattr(model.cfg, "validation_ds", None) is None:
+        model.cfg.validation_ds = OmegaConf.create({"use_start_end_token": False})
     model.to("cuda")
     model.eval()
     return model
@@ -758,7 +761,7 @@ def _prefetch_nemo_models(model_specs: list[AsrModelSpec]) -> None:
 
     seen: set[str] = set()
     for spec in model_specs:
-        if spec.backend != "nemo" or spec.model_name in seen:
+        if spec.backend not in {"nemo", "nemo_git"} or spec.model_name in seen:
             continue
         seen.add(spec.model_name)
         started = time.monotonic()
@@ -1115,7 +1118,7 @@ def _asr_worker_main_impl(config_path: str) -> None:
     )
     artifacts_volume.commit()
     model_load_started = time.monotonic()
-    if spec.backend == "nemo":
+    if spec.backend in {"nemo", "nemo_git"}:
         model = _load_nemo_model(spec)
     elif spec.backend == "nemo_salm":
         model = _load_nemo_salm_model(spec)
@@ -1123,7 +1126,7 @@ def _asr_worker_main_impl(config_path: str) -> None:
         model, processor = _load_transformers_model(spec, config, token=hf_token)
     model_load_seconds = time.monotonic() - model_load_started
 
-    if spec.backend == "nemo":
+    if spec.backend in {"nemo", "nemo_git"}:
         prediction_payload = _predict_nemo(
             spec=spec,
             model=model,
@@ -1479,7 +1482,7 @@ def _run_backend_group(
         backend_group=backend_group,
         model_specs=model_specs,
     )
-    if backend_group in {"nemo", "nemo_salm"}:
+    if backend_group in {"nemo", "nemo_git", "nemo_salm"}:
         _write_json(
             _backend_progress_path(run_id, backend_group),
             {
@@ -1492,7 +1495,7 @@ def _run_backend_group(
             },
         )
         artifacts_volume.commit()
-        if backend_group == "nemo":
+        if backend_group in {"nemo", "nemo_git"}:
             _prefetch_nemo_models(model_specs)
         else:
             _prefetch_nemo_salm_models(model_specs)
@@ -1898,6 +1901,29 @@ def asr_bakeoff_nemo_salm_5gpu_remote(payload: dict[str, Any]) -> dict[str, Any]
 
 
 @app.function(
+    image=nemo_salm_image,
+    gpu=FIVE_GPU,
+    timeout=60 * 60 * 4,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],
+    volumes={
+        str(ARTIFACTS_DIR): artifacts_volume,
+        str(HF_CACHE_DIR): hf_cache_volume,
+    },
+)
+def asr_bakeoff_nemo_git_5gpu_remote(payload: dict[str, Any]) -> dict[str, Any]:
+    os.environ["MODAL_GPU_LABEL"] = FIVE_GPU
+    config = _normalize_config(payload["config"])
+    run_id = str(payload["run_id"])
+    model_specs = [_normalize_model_spec(item) for item in payload["model_specs"]]
+    return _run_backend_group(
+        run_id=run_id,
+        config=config,
+        backend_group="nemo_git",
+        model_specs=model_specs,
+    )
+
+
+@app.function(
     image=transformers_image,
     gpu=FIVE_GPU,
     timeout=60 * 60 * 4,
@@ -1973,6 +1999,7 @@ def _run_bakeoff(config: AsrBakeoffConfig, *, run_id: str, parallel_backend_jobs
         if spec.backend in {"whisper_transformers", "cohere_transformers", "cohere_transformers_peft"}
     ]
     nemo_specs = [spec for spec in config.model_specs if spec.backend == "nemo"]
+    nemo_git_specs = [spec for spec in config.model_specs if spec.backend == "nemo_git"]
     nemo_salm_specs = [spec for spec in config.model_specs if spec.backend == "nemo_salm"]
     remote_payloads = []
     if transformers_specs:
@@ -1994,6 +2021,17 @@ def _run_bakeoff(config: AsrBakeoffConfig, *, run_id: str, parallel_backend_jobs
                     "run_id": run_id,
                     "config": asdict(config),
                     "model_specs": [asdict(spec) for spec in nemo_specs],
+                },
+            )
+        )
+    if nemo_git_specs:
+        remote_payloads.append(
+            (
+                asr_bakeoff_nemo_git_5gpu_remote,
+                {
+                    "run_id": run_id,
+                    "config": asdict(config),
+                    "model_specs": [asdict(spec) for spec in nemo_git_specs],
                 },
             )
         )

@@ -177,6 +177,7 @@ public enum TranscriptRecordOutcome: String, Sendable, Equatable, Codable {
 public enum ControlPanelSection: String, CaseIterable, Identifiable, Sendable, Codable {
     case dashboard
     case history
+    case benchmark
     case settings
 
     public var id: String { rawValue }
@@ -187,6 +188,8 @@ public enum ControlPanelSection: String, CaseIterable, Identifiable, Sendable, C
             return "Dashboard"
         case .history:
             return "History"
+        case .benchmark:
+            return "Benchmarks"
         case .settings:
             return "Settings"
         }
@@ -198,6 +201,8 @@ public enum ControlPanelSection: String, CaseIterable, Identifiable, Sendable, C
             return "Live controls"
         case .history:
             return "Saved sessions"
+        case .benchmark:
+            return "API test corpus"
         case .settings:
             return "Configuration"
         }
@@ -209,6 +214,8 @@ public enum ControlPanelSection: String, CaseIterable, Identifiable, Sendable, C
             return "square.grid.2x2"
         case .history:
             return "clock.arrow.circlepath"
+        case .benchmark:
+            return "speedometer"
         case .settings:
             return "gearshape"
         }

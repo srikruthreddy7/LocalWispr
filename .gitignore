@@ -38,6 +38,7 @@ tools/modal-smoke*
 # Local research scratch artifacts copied out of Modal volumes
 .codex-tmp/
 audit_artifacts/
+artifacts/
 
 # Optional local install / packaging (DMGs and staged app bundles)
 dist/

@@ -79,6 +79,8 @@ public final class AppState: ObservableObject {
     @Published public private(set) var latestDebugCaptureDirectoryURL: URL?
     @Published public private(set) var latestCapturedAudioIsPlaying: Bool = false
     @Published public private(set) var audioPreviewRecordingActive: Bool = false
+    @Published public private(set) var benchmarkCorpusEntries: [BenchmarkClipManifestEntry] = []
+    @Published public private(set) var benchmarkCorpusStatusLine: String = "No benchmark clips saved yet."
     @Published public var preferredInputDeviceID: UInt32? {
         didSet {
             guard preferredInputDeviceID != oldValue else { return }
@@ -117,6 +119,7 @@ public final class AppState: ObservableObject {
     private let transcriber: Transcriber
     private let pipeline: Pipeline
     private let transcriptHistoryStore: TranscriptHistoryStore
+    private let benchmarkCorpusStore: BenchmarkCorpusStore
     private let projectIndex: ProjectIdentifierIndex
 
     private let clock = ContinuousClock()
@@ -146,7 +149,8 @@ public final class AppState: ObservableObject {
         transcriber: Transcriber? = nil,
         cleaner: (any Cleaning)? = nil,
         inserter: (any Inserting)? = nil,
-        transcriptHistoryStore: TranscriptHistoryStore? = nil
+        transcriptHistoryStore: TranscriptHistoryStore? = nil,
+        benchmarkCorpusStore: BenchmarkCorpusStore? = nil
     ) {
         let resolvedTranscriber = transcriber ?? Transcriber()
         let preferredInputDeviceID = Self.loadPreferredInputDeviceID()
@@ -176,6 +180,7 @@ public final class AppState: ObservableObject {
             inserter: inserter ?? TextInserter()
         )
         self.transcriptHistoryStore = transcriptHistoryStore ?? TranscriptHistoryStore()
+        self.benchmarkCorpusStore = benchmarkCorpusStore ?? BenchmarkCorpusStore()
         resolvedTranscriber.onLiveTranscriptUpdate = { [weak self] transcript in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -205,6 +210,7 @@ public final class AppState: ObservableObject {
 
         Task {
             await loadTranscriptHistory()
+            await loadBenchmarkCorpus()
             await prewarmModels()
             await refreshAudioAndSpeechPermissions(promptIfNeeded: false, surfaceFailures: false)
             reconfigureHotkeyMonitor()
@@ -1045,6 +1051,99 @@ public final class AppState: ObservableObject {
             applyTranscriptHistory(records)
         } catch {
             Self.logger.error("Transcript history load failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func loadBenchmarkCorpus() async {
+        do {
+            benchmarkCorpusEntries = try benchmarkCorpusStore.loadManifest()
+            benchmarkCorpusStatusLine = benchmarkCorpusEntries.isEmpty
+                ? "No benchmark clips saved yet."
+                : "\(benchmarkCorpusEntries.count) benchmark clips saved."
+        } catch {
+            benchmarkCorpusStatusLine = "Unable to load benchmark corpus: \(error.localizedDescription)"
+        }
+    }
+
+    public var benchmarkCorpusDirectoryURL: URL {
+        benchmarkCorpusStore.rootURL
+    }
+
+    public func reloadBenchmarkCorpus() {
+        Task {
+            await loadBenchmarkCorpus()
+        }
+    }
+
+    public func saveLatestCaptureToBenchmarkCorpus(
+        category: BenchmarkClipCategory,
+        promptText: String,
+        referenceText: String
+    ) {
+        guard let latestCapturedAudioURL else {
+            benchmarkCorpusStatusLine = "Record audio before saving a benchmark clip."
+            return
+        }
+
+        do {
+            let entry = try benchmarkCorpusStore.saveClip(
+                audioURL: latestCapturedAudioURL,
+                category: category,
+                promptText: promptText,
+                referenceText: referenceText,
+                inputDeviceName: currentInputDeviceName
+            )
+            benchmarkCorpusEntries = try benchmarkCorpusStore.loadManifest()
+            let seconds = entry.durationMilliseconds.map { String(format: "%.1fs", Double($0) / 1_000.0) } ?? "unknown duration"
+            benchmarkCorpusStatusLine = "Saved \(entry.category.title) clip (\(seconds))."
+        } catch {
+            benchmarkCorpusStatusLine = "Unable to save benchmark clip: \(error.localizedDescription)"
+        }
+    }
+
+    public func revealBenchmarkCorpusInFinder() {
+        do {
+            try FileManager.default.createDirectory(at: benchmarkCorpusStore.rootURL, withIntermediateDirectories: true)
+            NSWorkspace.shared.activateFileViewerSelecting([benchmarkCorpusStore.rootURL])
+        } catch {
+            benchmarkCorpusStatusLine = "Unable to open benchmark corpus: \(error.localizedDescription)"
+        }
+    }
+
+    public func copyBenchmarkCorpusPath() {
+        copyToPasteboard(benchmarkCorpusStore.rootURL.path)
+        benchmarkCorpusStatusLine = "Benchmark corpus path copied."
+    }
+
+    public func recoverLatestDebugAudioCapture() {
+        let rootURL = URL(fileURLWithPath: "/tmp/localwispr-debug-captures", isDirectory: true)
+        do {
+            let sessionURLs = try FileManager.default.contentsOfDirectory(
+                at: rootURL,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            )
+
+            let candidates = sessionURLs.compactMap { sessionURL -> (audioURL: URL, modifiedAt: Date)? in
+                let audioURL = sessionURL.appendingPathComponent("audio.wav")
+                guard FileManager.default.fileExists(atPath: audioURL.path) else {
+                    return nil
+                }
+                let values = try? sessionURL.resourceValues(forKeys: [.contentModificationDateKey])
+                return (audioURL, values?.contentModificationDate ?? .distantPast)
+            }
+
+            guard let latest = candidates.max(by: { $0.modifiedAt < $1.modifiedAt }) else {
+                benchmarkCorpusStatusLine = "No debug recordings found in /tmp/localwispr-debug-captures."
+                return
+            }
+
+            stopLatestCapturedAudioPlayback()
+            latestCapturedAudioURL = latest.audioURL
+            latestDebugCaptureDirectoryURL = latest.audioURL.deletingLastPathComponent()
+            benchmarkCorpusStatusLine = "Recovered \(latest.audioURL.path). Add the exact reference text, then save."
+        } catch {
+            benchmarkCorpusStatusLine = "Unable to recover debug recording: \(error.localizedDescription)"
         }
     }
 

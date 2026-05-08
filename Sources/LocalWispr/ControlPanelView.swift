@@ -186,6 +186,9 @@ public struct ControlPanelView: View {
         case .history:
             TranscriptHistoryView(appState: appState)
                 .padding(4)
+        case .benchmark:
+            BenchmarkRecorderView(appState: appState)
+                .padding(4)
         case .settings:
             settingsView
         }

@@ -582,7 +582,7 @@ def _offline_engine_kwargs(config: BenchmarkConfig) -> dict[str, Any]:
     if config.enable_lora:
         kwargs["enable_lora"] = True
         kwargs["max_lora_rank"] = config.max_lora_rank
-    if family in {"cohere_asr", "generic_transcription"}:
+    if family in {"cohere_asr", "generic_transcription", "granite_speech"}:
         kwargs["trust_remote_code"] = True
     if family == "cohere_asr":
         kwargs["tokenizer"] = _cohere_processor_source(config)
@@ -671,7 +671,7 @@ def _start_vllm_server(config: BenchmarkConfig) -> tuple[subprocess.Popen[str], 
         "--gpu-memory-utilization",
         str(config.gpu_memory_utilization),
     ]
-    if family in {"cohere_asr", "generic_transcription"}:
+    if family in {"cohere_asr", "generic_transcription", "granite_speech"}:
         command.append("--trust-remote-code")
     if family == "cohere_asr":
         tokenizer_name = _cohere_processor_source(config)
